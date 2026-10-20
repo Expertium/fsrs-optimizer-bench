@@ -1,4 +1,6 @@
 target/
+baseline/
+experiments/
 __pycache__/
 *.pyc
 *.pyd

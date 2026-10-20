@@ -32,23 +32,31 @@ Each user is optimized three times; the minimum of those Rust-call timings is re
 
 The default dataset location is the repository's `data/` directory. Override it with `--data "D:\\datasets\\anki-revlogs-10k"` if needed.
 
-## Compare a candidate with the baseline
+## Prepare an isolated experiment
 
-Build both versions in separate Cargo target directories so one build cannot overwrite the other. Preserve the known-good baseline extension before rebuilding or changing the optimizer:
+Create the protected baseline once from the pinned original source revision, then create a clean worktree for each experiment number (1–20):
 
 ```powershell
-New-Item -ItemType Directory -Force profiling/measure | Out-Null
-Copy-Item fsrs_rs_python/target/release/fsrs_rs_python.abi3.pyd profiling/measure/baseline.abi3.pyd
+powershell -ExecutionPolicy Bypass -File scripts/experiment.ps1 -Action prepare-baseline
+powershell -ExecutionPolicy Bypass -File scripts/experiment.ps1 -Action new -Experiment 1
+```
+
+The helper builds the baseline in a detached worktree at commit `0485116`, stores its extension and SHA-256 manifest under the ignored `baseline/` directory, and refuses to overwrite an existing baseline. Each numbered experiment gets its own detached worktree outside the repository at `../fsrs-optimizer-bench-experiments/run-01`, with its own Cargo target directory and a local baseline copy at `baseline/fsrs_rs_python.abi3.pyd`. Make candidate changes only in that experiment worktree. Never edit, rebuild over, or copy candidate output into the protected top-level `baseline/` artifact. Do not bundle setup changes with an optimizer experiment.
+
+From `../fsrs-optimizer-bench-experiments/run-01`, build the candidate and run its paired comparison:
+
+```powershell
 $env:CARGO_TARGET_DIR = "fsrs_rs_python/target/experiment-01"
 cargo +1.85 build --manifest-path fsrs_rs_python/Cargo.toml --release --features pyo3/extension-module,pyo3/abi3-py312
 Copy-Item fsrs_rs_python/target/experiment-01/release/fsrs_rs_python.dll profiling/measure/candidate.abi3.pyd
-uv run python compute_parameters.py --algo FSRS-rs --short --secs --recency --max-user-id 50 --run-name experiment-01 --paired profiling/measure/baseline.abi3.pyd profiling/measure/candidate.abi3.pyd
+uv run python compute_parameters.py --algo FSRS-rs --short --secs --recency --max-user-id 50 --run-name experiment-01 --paired baseline/fsrs_rs_python.abi3.pyd profiling/measure/candidate.abi3.pyd
 ```
 
-The paired harness runs both builds on the same user's data concurrently, alternates their CPU blocks and start order across three repetitions, then reports the median per-user `baseline_ms / candidate_ms` ratio, both mean LogLoss values, and whether the candidate meets the accuracy band. Per-user timings and summary are saved as JSON under `result/`. Paired timing requires Windows and at least eight logical CPUs; use single-build runs in alternating order and clearly label them unpaired on other systems. See [DETAILS.md](DETAILS.md) for the protocol and leaderboard fields.
+Do not reuse a run number after an accepted or rejected completed result. Failed/incomplete attempts may be fixed and retried under the same number; only a completed result that misses the accuracy band or 1.5% speed threshold consumes the 20-run budget.
 
-Python builds expanding-prefix items per card. It does not pass card IDs: card-grouped windows were added as an optimizer speedup and are absent from the baseline.
+The paired harness launches baseline and candidate in separate processes for the same single user's data. It alternates launch order over three repetitions without modifying CPU affinity or priority, then reports the median per-user `baseline_ms / candidate_ms` ratio, both mean LogLoss values, and the accepted/rejected outcome for complete runs. Per-user timings and summary are saved as JSON under `result/`. See [PROTOCOL.md](PROTOCOL.md) for the complete acceptance rules and implementation constraints.
+
 
 ## Correctness and experiment rules
 
-`tests/test_fsrs7_math.py` compares Rust memory-state trajectories against an independent scalar transcription of finished FSRS-7, including lapse surprise and the short-trace reset. Keep candidate changes focused on the Rust optimizer and preserve model equations, training settings, and benchmark inputs. For each of at most 20 experiments, record model/provider and slug, prompt/version, API cost and available token counts, source revision, paired speedup, per-user timing summary, LogLoss, and machine/software environment. A result outside the accuracy band is not a valid speedup.
+`tests/test_fsrs7_math.py` compares Rust memory-state trajectories against an independent scalar transcription of finished FSRS-7, including lapse surprise and the short-trace reset. Follow [PROTOCOL.md](PROTOCOL.md) for experiment scope, acceptance criteria, worktree isolation, and fairness constraints.

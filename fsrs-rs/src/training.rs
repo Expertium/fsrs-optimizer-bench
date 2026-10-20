@@ -1293,7 +1293,7 @@ pub(crate) struct TrainingConfig {
 /// Input parameters for computing FSRS parameters
 #[derive(Clone, Debug)]
 pub struct ComputeParametersInput {
-    /// The training set containing review history
+    /// Review-history items for exactly one user's optimizer run.
     pub train_set: Vec<FSRSItem>,
     /// Optional progress tracking
     pub progress: Option<Arc<Mutex<CombinedProgressState>>>,
