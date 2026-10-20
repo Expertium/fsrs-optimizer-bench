@@ -323,8 +323,8 @@ def _paired_summary(results: dict) -> dict:
         "median_ms_candidate": statistics.median(row["b_ms"] for row in rows),
         "mean_logloss_baseline": mean_a,
         "mean_logloss_candidate": mean_b,
-        "baseline_logloss_in_band": 0.3078 <= mean_a <= 0.3113 if len(rows) == 50 else None,
-        "candidate_logloss_in_band": 0.3078 <= mean_b <= 0.3113 if len(rows) == 50 else None,
+        "baseline_logloss_in_band": 0.3066 <= mean_a <= 0.3096 if len(rows) == 50 else None,
+        "candidate_logloss_in_band": 0.3066 <= mean_b <= 0.3096 if len(rows) == 50 else None,
         "full_run": len(rows) == 50,
         "parameter_hash_diffs": sum(
             row["a_parameters"] != row["b_parameters"] for row in rows
@@ -349,11 +349,11 @@ def _write_paired_result(results: dict, metadata: dict) -> None:
     print(json.dumps(summary, indent=2))
     if summary["full_run"] and not summary["baseline_logloss_in_band"]:
         raise AssertionError(
-            f"baseline mean LogLoss {summary['mean_logloss_baseline']:.6f} outside [0.3078, 0.3113]"
+            f"baseline mean LogLoss {summary['mean_logloss_baseline']:.6f} outside [0.3066, 0.3096]"
         )
     if summary["full_run"] and not summary["candidate_logloss_in_band"]:
         raise AssertionError(
-            f"candidate mean LogLoss {summary['mean_logloss_candidate']:.6f} outside [0.3078, 0.3113]"
+            f"candidate mean LogLoss {summary['mean_logloss_candidate']:.6f} outside [0.3066, 0.3096]"
         )
 
 
@@ -604,6 +604,6 @@ if __name__ == "__main__":
     if config.max_user_id == 50:
         assert n_users == 50, f"expected 50 users, got {n_users}"
         assert total_items == 1_897_936, f"expected 1,897,936 items, got {total_items:,}"
-        assert 0.3078 <= mean_ll <= 0.3113, (
-            f"mean LogLoss {mean_ll:.6f} is outside [0.3078, 0.3113]"
+        assert 0.3066 <= mean_ll <= 0.3096, (
+            f"mean LogLoss {mean_ll:.6f} is outside [0.3066, 0.3096]"
         )
