@@ -1,6 +1,7 @@
 [project]
 name = "fsrs-optimizer-bench"
 version = "0.1.0"
+description = "Reproducible FSRS optimizer performance benchmark"
 requires-python = ">=3.12"
 dependencies = [
     "fsrs-rs-python",

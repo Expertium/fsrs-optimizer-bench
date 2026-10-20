@@ -1,6 +1,6 @@
-# FSRS-Optimizer-Bench
+# FSRS Optimizer Bench
 
-A reproducible benchmark for experiments that make the FSRS parameter optimizer faster. It uses the slow, pre-accepted-speedup Burn/autodiff optimizer with the later, finished 34-parameter FSRS-7 model.
+A self-contained, reproducible benchmark for experiments that make the FSRS parameter optimizer faster. It uses the slow, pre-accepted-speedup Burn/autodiff optimizer with the later, finished 34-parameter FSRS-7 model.
 
 ## What is being benchmarked
 - Training uses the original Burn/autodiff optimizer from before the first accepted speedup (history iteration 2). It retains the autodiff training and validation passes and per-epoch best-model selection.
@@ -10,7 +10,7 @@ A reproducible benchmark for experiments that make the FSRS parameter optimizer 
 This repository intentionally does **not** include the original project's complexity scorer or speedups. It benchmarks how much a model accelerates this fixed optimizer.
 ## Requirements and setup
 
-Use Windows 10/11 x64, Python 3.12+, `uv`, and the `anki-revlogs-10k` dataset (not included). Put the dataset beside the repository as `../anki-revlogs-10k`, or pass its path with `--data`. The canonical configuration uses users 1–50 and expects all 50 user partitions. The Rust crate pins toolchain 1.85; use the included `rust-toolchain.toml` or `cargo +1.85` for explicit commands.
+Use Windows 10/11 x64, Python 3.12+, `uv`, and Rust 1.85 (pinned in `fsrs-rs/rust-toolchain.toml`). The repository includes the revlog partitions for users 1–50, so no Hugging Face download is needed. This is the corresponding subset of the public [open-spaced-repetition/anki-revlogs-10k](https://huggingface.co/datasets/open-spaced-repetition/anki-revlogs-10k) dataset; only numeric review logs are included. To use a different copy, pass its dataset root with `--data`.
 
 From the repository directory:
 
@@ -20,7 +20,7 @@ uv run python -m pytest -q
 cargo +1.85 fmt --manifest-path fsrs-rs/Cargo.toml --all -- --check
 ```
 
-`uv sync` installs the project and test dependencies from the lockfile. The local Rust extension is built automatically on first import using the pinned Rust toolchain and the CPython stable ABI (Python 3.12+).
+`uv sync` installs the project and test dependencies from the lockfile. The local Rust extension is built automatically on first import using the pinned Rust toolchain and the CPython stable ABI (Python 3.12+). The bundled data includes only numeric review-log fields; card IDs are factorized within each user as in the source dataset.
 
 ## Run the canonical 50-user benchmark
 
@@ -30,7 +30,7 @@ uv run python compute_parameters.py --algo FSRS-rs --short --secs --recency --pr
 
 Each user is optimized three times; the minimum of those Rust-call timings is recorded, and LogLoss is evaluated afterwards. The canonical run checks exactly 50 users, **1,897,936 items**, and mean LogLoss in **[0.3066, 0.3096]** (0.3081 ± 0.0015). Results go to `result/compute_parameters-FSRS-rs-short-secs-recency-baseline.jsonl`; the summary is printed at completion. A distinct `--run-name` keeps each run separate. If a run is interrupted, rerun the same command to resume missing users; delete that named result file first if you intentionally want a clean repeat. Paired comparisons save per-user progress and resume only when the build hashes, dataset path, user set, and repeat count still match.
 
-The default dataset location is `../anki-revlogs-10k`. Override it with `--data "D:\\datasets\\anki-revlogs-10k"` if needed.
+The default dataset location is the repository's `data/` directory. Override it with `--data "D:\\datasets\\anki-revlogs-10k"` if needed.
 
 ## Compare a candidate with the baseline
 

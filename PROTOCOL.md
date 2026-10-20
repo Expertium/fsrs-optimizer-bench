@@ -1,7 +1,9 @@
-# Measurement protocol and correctness requirements
-This is the measurement contract for FSRS-Optimizer-Bench. A faster optimizer only counts when it remains inside the accuracy band on the fixed user set.
+# FSRS Optimizer Bench protocol
+
+This is the measurement contract for FSRS Optimizer Bench. A faster optimizer only counts when it remains inside the accuracy band on the fixed user set.
+
 ## Frozen benchmark
-- **Dataset:** `anki-revlogs-10k`, users 1-50; the run processes 1,897,936 optimizer items.
+- **Dataset:** bundled revlog data for users 1–50, derived from the public [`open-spaced-repetition/anki-revlogs-10k`](https://huggingface.co/datasets/open-spaced-repetition/anki-revlogs-10k) dataset; the run processes 1,897,936 optimizer items.
 - **Input mode:** include short-term reviews, use elapsed seconds converted to days, and apply the existing recency weighting (`--short --secs --recency`). Preserve item order, filtering, seed, and batch construction.
 - **Model:** finished 34-parameter FSRS-7. Reference equations are in [`models/fsrs_v7.py`](https://github.com/open-spaced-repetition/srs-benchmark/blob/main/models/fsrs_v7.py); the Rust recurrence is in `fsrs-rs/src/model.rs`.
 - **Optimizer baseline:** unoptimized Burn/autodiff implementation, 9 epochs, batch size 256, seed 2023, learning rate 0.0282, Adam beta values 0.55 and 0.9942, and per-epoch validation/best-epoch selection. Do not add grouped windows, a handwritten/analytic gradient, SIMD, host-side Adam, or other optimizer speedups to the baseline.

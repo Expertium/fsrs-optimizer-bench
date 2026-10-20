@@ -84,11 +84,10 @@ def create_parser():
         help="Enable FSRS-7 scheduling penalties (penalty 1 & 2). L2 penalty is always on. (default: False)",
     )
 
-    # download revlogs from huggingface
     parser.add_argument(
         "--data",
-        default="../anki-revlogs-10k",
-        help="path to revlogs/*.parquet",
+        default=str(Path(__file__).resolve().parent / "data"),
+        help="path to the dataset root containing revlogs/*.parquet",
     )
 
     # short-term memory research
