@@ -1,0 +1,281 @@
+from abc import ABC, abstractmethod
+from itertools import chain
+from typing import Optional, List, Tuple
+import pandas as pd
+from config import Config
+from utils import cum_concat
+
+
+def _to_history_list(col):
+    return cum_concat(list(map(lambda x: [x], col)))
+
+
+def _fmt_history(history_list):
+    return list(map(lambda item: ",".join(map(str, item[:-1])), chain.from_iterable(history_list)))
+
+
+class BaseFeatureEngineer(ABC):
+    """
+    Base abstract class for feature engineering
+    Each specific model feature engineer should inherit from this class and implement the corresponding methods
+    """
+
+    def __init__(self, config: Config):
+        """
+        Initialize the feature engineer
+
+        Args:
+            config: Configuration object containing model parameters
+        """
+        self.config = config
+
+    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Main feature creation method that includes common preprocessing steps for all models
+
+        Args:
+            df: Input raw dataframe
+
+        Returns:
+            Processed feature dataframe
+        """
+        # Execute common preprocessing steps
+        df = self._common_preprocessing(df.copy())
+
+        # Compute history records
+        df = self._compute_histories(df)
+
+        # Model-specific feature engineering
+        df = self._model_specific_features(df)
+
+        # Execute common postprocessing steps
+        df = self._common_postprocessing(df)
+
+        # Model-specific postprocessing steps
+        df = self._model_specific_postprocessing(df)
+
+        return df
+
+    def _common_preprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Common preprocessing steps shared by all models
+        """
+        # Add review sequence number
+        df["review_th"] = range(1, df.shape[0] + 1)
+        df.sort_values(by=["card_id", "review_th"], inplace=True)
+
+        # Filter invalid ratings
+        df.drop(df[~df["rating"].isin([1, 2, 3, 4])].index, inplace=True)
+
+        # Calculate review count
+        df["i"] = df.groupby("card_id").cumcount() + 1
+        df.drop(df[df["i"] > self.config.max_seq_len * 2].index, inplace=True)
+
+        # Process time intervals
+        df = self._process_time_intervals(df)
+
+        def _handle_short_term():
+            # Handle short-term reviews
+            if not self.config.include_short_term:
+                df.drop(df[df["elapsed_days"] == 0].index, inplace=True)
+                df["i"] = df.groupby("card_id").cumcount() + 1
+
+        _handle_short_term()
+        return df
+
+    def _process_time_intervals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Process time interval related fields
+        """
+        def _maybe_init_delta_t():
+            if "delta_t" in df.columns:
+                return
+            if not {"elapsed_days", "elapsed_seconds"}.issubset(df.columns):
+                return
+            df["delta_t"] = df["elapsed_days"]
+            if self.config.use_secs_intervals:
+                df["delta_t_secs"] = df["elapsed_seconds"] / 86400
+                df["delta_t_secs"] = df["delta_t_secs"].map(lambda x: max(0, x))
+
+        _maybe_init_delta_t()
+        df["delta_t"] = df["delta_t"].map(lambda x: max(0, x))
+        df["delta_t_int"] = df["elapsed_days"].map(lambda x: max(0, x))
+        return df
+
+    def _compute_histories(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute time and rating history records
+        """
+        # Calculate time history (non-seconds)
+        t_history_non_secs_list = df.groupby("card_id", group_keys=False)[
+            "delta_t"
+        ].apply(_to_history_list)
+
+        def _secs_history():
+            # Calculate time history (seconds)
+            if self.config.use_secs_intervals:
+                return df.groupby("card_id", group_keys=False)[
+                    "delta_t_secs"
+                ].apply(_to_history_list)
+            return None
+
+        t_history_secs_list: Optional[pd.Series] = _secs_history()
+
+        # Calculate rating history
+        r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
+            _to_history_list
+        )
+
+        # Calculate last rating
+        last_rating = self._compute_last_rating(t_history_non_secs_list, r_history_list)
+        df["last_rating"] = last_rating
+
+        # Set history record strings
+        df["r_history"] = _fmt_history(r_history_list)
+
+        # Process time history strings
+        df = self._set_time_histories(
+            df,
+            t_history_non_secs_list,
+            t_history_secs_list,
+        )
+
+        return df
+
+    def _compute_last_rating(
+        self, t_history_list: pd.Series, r_history_list: pd.Series
+    ) -> List[int]:
+        """
+        Calculate the previous rating for each review
+        """
+        def _compute():
+            return [
+                next(
+                    map(lambda pr: pr[1], filter(lambda pr: pr[0] > 0, zip(reversed(t[:-1]), reversed(r[:-1])))),
+                    r[0],
+                )
+                for t_sublist, r_sublist in zip(t_history_list, r_history_list)
+                for t, r in zip(t_sublist, r_sublist)
+            ]
+        return _compute()
+
+    def _set_time_histories(
+        self,
+        df: pd.DataFrame,
+        t_history_non_secs_list: pd.Series,
+        t_history_secs_list: Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
+        """
+        Set time history string fields
+        """
+        def _assign():
+            if t_history_secs_list is not None:
+                if self.config.equalize_test_with_non_secs:
+                    df["t_history"] = _fmt_history(t_history_non_secs_list)
+                    df["t_history_secs"] = _fmt_history(t_history_secs_list)
+                else:
+                    df["t_history"] = _fmt_history(t_history_secs_list)
+                df["delta_t"] = df["delta_t_secs"]
+            else:
+                df["t_history"] = _fmt_history(t_history_non_secs_list)
+
+        _assign()
+        return df
+
+    @abstractmethod
+    def _model_specific_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Model-specific feature engineering logic, needs to be implemented in subclasses
+
+        Args:
+            df: Dataframe after common preprocessing
+
+        Returns:
+            Dataframe with model-specific features added
+        """
+        pass
+
+    def _common_postprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Common postprocessing steps shared by all models
+        """
+        # Set first rating and labels
+        df["first_rating"] = (
+            df.groupby("card_id")["rating"].transform("first").astype(str)
+        )
+        df["y"] = df["rating"].map(lambda x: {1: 0, 2: 1, 3: 1, 4: 1}[x])
+
+        # Find lapses for RMSE (bins)
+        df["is_lapse"] = (
+            (df["rating"] == 1) & (df["delta_t"].astype(str) != "0")
+        ).astype(int)
+        df["rmse_bins_lapse"] = (
+            df.groupby("card_id")["is_lapse"].transform("cumsum") - df["is_lapse"]
+        )
+        df.drop(columns=["is_lapse"], inplace=True)
+
+        # Recalculate review sequence number
+        df["i"] = df["elapsed_days"].gt(0).groupby(df["card_id"]).cumsum().add(1)
+
+        def _filter_and_validate(df):
+            # Handle short-term reviews
+            if self.config.include_short_term:
+                df = df[(df["delta_t"] != 0) | (df["i"] == 1)].copy()
+            return df
+
+        df = _filter_and_validate(df)
+        return df[df["delta_t"] > 0].sort_values(by=["review_th"])
+
+    def get_time_history_list(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Get time history list for feature engineering
+
+        Args:
+            df: Input dataframe
+
+        Returns:
+            Time history list as pandas Series
+        """
+        if all([self.config.use_secs_intervals, not self.config.equalize_test_with_non_secs]):
+            col = "delta_t_secs"
+        else:
+            col = "delta_t"
+        return df.groupby("card_id", group_keys=False)[col].apply(_to_history_list)
+
+    def get_rating_history_list(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Get rating history list for feature engineering
+
+        Args:
+            df: Input dataframe
+
+        Returns:
+            Rating history list as pandas Series
+        """
+        r_history_list = df.groupby("card_id", group_keys=False)["rating"].apply(
+            _to_history_list
+        )
+        return r_history_list
+
+    def get_history_lists(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+        """
+        Get history record lists for feature engineering
+
+        Returns:
+            Tuple of (time_history_list, rating_history_list)
+        """
+        t_history_list = self.get_time_history_list(df)
+        r_history_list = self.get_rating_history_list(df)
+        return t_history_list, r_history_list
+
+    def _model_specific_postprocessing(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Model-specific post processing
+
+        Args:
+            df: Dataframe after common post processing
+
+        Returns:
+            Dataframe with model-specific post processing
+        """
+        return df

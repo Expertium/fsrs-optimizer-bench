@@ -1,0 +1,21 @@
+[project]
+name = "fsrs-optimizer-bench"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fsrs-rs-python",
+    "numpy",
+    "pandas",
+    "pyarrow>=15",
+    "relplot>=1.0",
+    "scikit-learn",
+    "statsmodels>=0.14",
+    "torch>=2.9",
+    "tqdm",
+]
+[tool.uv]
+package = false
+[tool.uv.sources]
+fsrs-rs-python = { path = "fsrs_rs_python" }
+[tool.pytest.ini_options]
+testpaths = ["tests"]

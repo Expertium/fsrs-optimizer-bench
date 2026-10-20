@@ -1,0 +1,26 @@
+target/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.pdb
+*.exe
+.venv/
+
+# Profiling-only measurement snapshots (transient; durable record is result/history.*)
+profiling/measure/
+profiling/measure_bench/
+
+# Scratch file for multi-line commit messages (git commit -F); never part of the repo
+_commit_msg.txt
+
+# Generated benchmark outputs
+result/*.jsonl
+result/*.log
+result/*.tmp
+
+# Python tooling
+.venv/
+.pytest_cache/
+
+profiling/measure/*.pyd

@@ -1,0 +1,1625 @@
+use crate::error::Result;
+use crate::model::{Model, clip_parameters, parameters_to_model};
+use crate::{DEFAULT_PARAMETERS, FSRSError};
+use burn::LearningRate;
+use burn::backend::Autodiff;
+use burn::backend::ndarray::NdArray;
+use burn::config::Config;
+use burn::data::dataloader::batcher::Batcher;
+use burn::data::dataloader::{DataLoaderIterator, Progress};
+use burn::data::dataset::Dataset;
+use burn::lr_scheduler::LrScheduler;
+use burn::module::{AutodiffModule, Param};
+use burn::nn::loss::Reduction;
+use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::prelude::Backend;
+use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::cast::ToElement;
+use burn::tensor::{Float, Int, Shape, Tensor, TensorData};
+use burn::train::TrainingInterrupter;
+use burn::train::renderer::{MetricState, MetricsRenderer, TrainingProgress};
+use core::marker::PhantomData;
+use itertools::Itertools;
+use log::info;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+mod training_v7 {
+    use crate::model::{S_MAX, S_MIN};
+
+    pub(crate) const PARAM_LEN: usize = 34;
+    pub(crate) const PENALTY_W_1: f64 = 0.5;
+    pub(crate) const PENALTY_W_2: f64 = 0.0015;
+    pub(crate) const PENALTY_W_L2: f64 = 0.5;
+    pub(crate) const PENALTY_N_REVIEWS: usize = 10;
+    pub(crate) const PENALTY_TARGET_DR: f32 = 0.90;
+    pub(crate) const PENALTY_TARGET_DRS: [f32; 1] = [0.99];
+    pub(crate) const PENALTY_N_NEWTON: usize = 4;
+    pub(crate) const MIN_T: f32 = 1.0 / 86400.0;
+    pub(crate) const MAX_T: f32 = 36500.0;
+    pub(crate) const ONE_DAY: f32 = 1.0;
+    pub(crate) const SHORT_C: f32 = 600.0 / 86400.0;
+    pub(crate) const INV_C: f32 = 1.0 / SHORT_C;
+    pub(crate) const GRAD_LEN: usize = 34;
+    // L2 prior sigmas for the finished 34-param layout (FSRS7_L2_SIGMA_35_VALUES, fail_d_exp dropped).
+    // 0..3 free (9999), 4..22 difficulty/long+short stability, 23..30 forgetting curve,
+    // 31 d_weight, 32 d_decay, 33 s_decay1.
+    pub(crate) const PARAMS_STDDEV: [f32; 34] = [
+        9999.0, 9999.0, 9999.0, 9999.0, 0.523, 0.2528, 0.4329, 0.2966, 0.2139, 0.2889, 0.1862,
+        0.175, 0.3812, 0.3013, 0.9104, 0.3234, 0.2448, 0.3273, 0.1842, 0.1735, 0.4608, 0.311,
+        0.864, 0.0418, 0.2596, 0.0798, 0.0682, 0.1282, 0.1397, 0.1407, 0.1489, 0.2, 0.15, 0.15,
+    ];
+
+    pub(crate) fn l2_penalty_value_and_grad(
+        w: &[f32],
+        init_w: &[f32],
+        batch_size: usize,
+        total_size: usize,
+        l2_weight: f64,
+        params_stddev: &[f32],
+    ) -> (f64, Vec<f32>) {
+        let mut grad = vec![0.0f32; w.len()];
+        if total_size == 0 {
+            return (0.0, grad);
+        }
+        let size = w.len().min(init_w.len()).min(params_stddev.len());
+        let scale = l2_weight * batch_size as f64 / total_size as f64;
+        let mut penalty_sum = 0.0f64;
+        for i in 0..size {
+            let sigma = params_stddev[i] as f64;
+            let denom = sigma * sigma;
+            let diff = w[i] as f64 - init_w[i] as f64;
+            penalty_sum += diff * diff / denom;
+            grad[i] = (2.0 * diff / denom * scale) as f32;
+        }
+        let penalty = penalty_sum * scale;
+        if !penalty.is_finite() {
+            return (0.0, vec![0.0; w.len()]);
+        }
+        for g in &mut grad {
+            if !g.is_finite() {
+                *g = 0.0;
+            }
+        }
+        (penalty, grad)
+    }
+
+    // Keep Dual35 local to FSRS-7 training: the penalty objective and its gradients
+    // are expressed against FSRS-7's parameter layout and index mapping.
+    //
+    // NOTE (iter-66 dual-trace port): the schedule penalty below is DISABLED by default
+    // (enable_sched_penalties = false in every timed path) and was NOT migrated to the
+    // new 36-param dual-trace layout — its w-indices (e.g. the curve at 27..34, the
+    // transition blend at 25/26) still refer to the pre-port single-trace layout. Do
+    // not enable it without first reworking these indices and the stability recurrence.
+    #[derive(Clone, Copy, Debug)]
+    struct Dual35 {
+        value: f64,
+        grad: [f64; GRAD_LEN],
+    }
+
+    impl Dual35 {
+        fn constant(value: f64) -> Self {
+            Self {
+                value,
+                grad: [0.0; GRAD_LEN],
+            }
+        }
+
+        fn variable(value: f64, idx: usize) -> Self {
+            let mut grad = [0.0; GRAD_LEN];
+            if idx < GRAD_LEN {
+                grad[idx] = 1.0;
+            }
+            Self { value, grad }
+        }
+
+        fn add(self, rhs: Self) -> Self {
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] + rhs.grad[i];
+            }
+            Self {
+                value: self.value + rhs.value,
+                grad,
+            }
+        }
+
+        fn sub(self, rhs: Self) -> Self {
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] - rhs.grad[i];
+            }
+            Self {
+                value: self.value - rhs.value,
+                grad,
+            }
+        }
+
+        fn neg(self) -> Self {
+            self.mul_const(-1.0)
+        }
+
+        fn mul(self, rhs: Self) -> Self {
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] * rhs.value + rhs.grad[i] * self.value;
+            }
+            Self {
+                value: self.value * rhs.value,
+                grad,
+            }
+        }
+
+        fn div(self, rhs: Self) -> Self {
+            let denom = (rhs.value * rhs.value).max(1e-18);
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = (self.grad[i] * rhs.value - self.value * rhs.grad[i]) / denom;
+            }
+            Self {
+                value: self.value / rhs.value,
+                grad,
+            }
+        }
+
+        fn add_const(self, rhs: f64) -> Self {
+            Self {
+                value: self.value + rhs,
+                grad: self.grad,
+            }
+        }
+
+        fn sub_const(self, rhs: f64) -> Self {
+            Self {
+                value: self.value - rhs,
+                grad: self.grad,
+            }
+        }
+
+        fn const_sub(self, lhs: f64) -> Self {
+            self.neg().add_const(lhs)
+        }
+
+        fn mul_const(self, rhs: f64) -> Self {
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] * rhs;
+            }
+            Self {
+                value: self.value * rhs,
+                grad,
+            }
+        }
+
+        fn div_const(self, rhs: f64) -> Self {
+            self.mul_const(1.0 / rhs)
+        }
+
+        fn exp(self) -> Self {
+            let value = self.value.exp();
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] * value;
+            }
+            Self { value, grad }
+        }
+
+        fn log(self) -> Self {
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] / self.value;
+            }
+            Self {
+                value: self.value.ln(),
+                grad,
+            }
+        }
+
+        fn powf(self, exp: f64) -> Self {
+            let value = self.value.powf(exp);
+            let coeff = exp * self.value.powf(exp - 1.0);
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] * coeff;
+            }
+            Self { value, grad }
+        }
+
+        fn powi(self, exp: i32) -> Self {
+            let value = self.value.powi(exp);
+            let coeff = (exp as f64) * self.value.powi(exp - 1);
+            let mut grad = [0.0; GRAD_LEN];
+            for (i, item) in grad.iter_mut().enumerate().take(GRAD_LEN) {
+                *item = self.grad[i] * coeff;
+            }
+            Self { value, grad }
+        }
+
+        fn pow(self, exp: Self) -> Self {
+            let base = self.clamp_min(1e-12);
+            exp.mul(base.log()).exp()
+        }
+
+        fn clamp_min(self, min: f64) -> Self {
+            if self.value < min {
+                Self::constant(min)
+            } else {
+                self
+            }
+        }
+
+        fn clamp_max(self, max: f64) -> Self {
+            if self.value > max {
+                Self::constant(max)
+            } else {
+                self
+            }
+        }
+
+        fn clamp(self, min: f64, max: f64) -> Self {
+            self.clamp_min(min).clamp_max(max)
+        }
+
+        fn min(self, rhs: Self) -> Self {
+            if self.value <= rhs.value { self } else { rhs }
+        }
+
+        fn max(self, rhs: Self) -> Self {
+            if self.value >= rhs.value { self } else { rhs }
+        }
+    }
+
+    fn dual_weights(w: &[f32]) -> [Dual35; GRAD_LEN] {
+        std::array::from_fn(|i| Dual35::variable(w[i] as f64, i))
+    }
+
+    fn fsrs7_fc_r_and_drdt_scalar(t: f64, s: f64, w: &[f32]) -> (f64, f64) {
+        let s_safe = s.max(1e-12);
+        let decay1 = -(w[27] as f64);
+        let decay2 = -(w[28] as f64);
+        let base1 = (w[29] as f64).max(1e-4);
+        let base2 = (w[30] as f64).max(1e-4);
+        let bw1 = (w[31] as f64).max(1e-4);
+        let bw2 = (w[32] as f64).max(1e-4);
+        let swp1 = w[33] as f64;
+        let swp2 = w[34] as f64;
+
+        let c1 = base1.powf(1.0 / decay1) - 1.0;
+        let c2 = base2.powf(1.0 / decay2) - 1.0;
+        let tos = t / s_safe;
+        let inner1 = (1.0 + c1 * tos).max(1e-9);
+        let inner2 = (1.0 + c2 * tos).max(1e-9);
+        let r1 = inner1.powf(decay1);
+        let r2 = inner2.powf(decay2);
+
+        let wt1 = bw1 * s_safe.powf(-swp1);
+        let wt2 = bw2 * s_safe.powf(swp2);
+        let wt_sum = (wt1 + wt2).max(1e-9);
+        let r = ((wt1 * r1 + wt2 * r2) / wt_sum).clamp(0.0, 1.0);
+
+        let dr1_dt = decay1 * inner1.powf(decay1 - 1.0) * (c1 / s_safe);
+        let dr2_dt = decay2 * inner2.powf(decay2 - 1.0) * (c2 / s_safe);
+        let dr_dt = ((wt1 * dr1_dt + wt2 * dr2_dt) / wt_sum).clamp(-1e9, 0.0);
+        (r, dr_dt)
+    }
+
+    fn fsrs7_fc_r_dual(t: Dual35, s: Dual35, w: &[Dual35]) -> Dual35 {
+        let decay1 = w[27].neg();
+        let decay2 = w[28].neg();
+        let base1 = w[29].clamp_min(1e-4);
+        let base2 = w[30].clamp_min(1e-4);
+        let bw1 = w[31].clamp_min(1e-4);
+        let bw2 = w[32].clamp_min(1e-4);
+        let swp1 = w[33];
+        let swp2 = w[34];
+
+        let c1 = base1.pow(decay1.powi(-1)).sub_const(1.0);
+        let c2 = base2.pow(decay2.powi(-1)).sub_const(1.0);
+        let tos = t.div(s);
+        let inner1 = c1.mul(tos).add_const(1.0).clamp_min(1e-9);
+        let inner2 = c2.mul(tos).add_const(1.0).clamp_min(1e-9);
+
+        let r1 = inner1.pow(decay1);
+        let r2 = inner2.pow(decay2);
+
+        let wt1 = bw1.mul(s.pow(swp1.neg()));
+        let wt2 = bw2.mul(s.pow(swp2));
+        let wt_sum = wt1.add(wt2).clamp_min(1e-9);
+        wt1.mul(r1).add(wt2.mul(r2)).div(wt_sum).clamp(0.0, 1.0)
+    }
+
+    fn fsrs7_init_d_dual(rating: f64, w: &[Dual35]) -> Dual35 {
+        w[4].sub(w[5].mul_const(rating - 1.0).exp())
+            .add_const(1.0)
+            .clamp(1.0, 10.0)
+    }
+
+    fn fsrs7_next_d_good_dual(d: Dual35, init_d4: Dual35) -> Dual35 {
+        init_d4
+            .mul_const(0.01)
+            .add(d.mul_const(0.99))
+            .clamp(1.0, 10.0)
+    }
+
+    fn fsrs7_s_fail_long_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35]) -> Dual35 {
+        let raw = w[10]
+            .mul(d.pow(w[11].neg()))
+            .mul(s.add_const(1.0).pow(w[12]).sub_const(1.0))
+            .mul(r.const_sub(1.0).mul(w[13]).exp());
+        s.min(raw)
+    }
+
+    fn fsrs7_s_fail_short_dual(s: Dual35, d: Dual35, r: Dual35, w: &[Dual35]) -> Dual35 {
+        let raw = w[19]
+            .mul(d.pow(w[20].neg()))
+            .mul(s.add_const(1.0).pow(w[21]).sub_const(1.0))
+            .mul(r.const_sub(1.0).mul(w[22]).exp());
+        s.min(raw)
+    }
+
+    fn fsrs7_next_s_good_dual(s: Dual35, d: Dual35, delta_t: Dual35, w: &[Dual35]) -> Dual35 {
+        let r = fsrs7_fc_r_dual(delta_t, s, w).clamp(0.0001, 0.9999);
+
+        let sf_l = fsrs7_s_fail_long_dual(s, d, r, w);
+        let si_l = w[7]
+            .sub_const(1.5)
+            .exp()
+            .mul(d.const_sub(11.0))
+            .mul(s.pow(w[8].neg()))
+            .mul(
+                r.const_sub(1.0)
+                    .mul(w[9])
+                    .clamp_max(30.0)
+                    .exp()
+                    .sub_const(1.0),
+            )
+            .add_const(1.0);
+        let s_lng = sf_l.max(s.mul(si_l));
+
+        let sf_sh = fsrs7_s_fail_short_dual(s, d, r, w);
+        let si_sh = w[16]
+            .sub_const(1.5)
+            .exp()
+            .mul(d.const_sub(11.0))
+            .mul(s.pow(w[17].neg()))
+            .mul(
+                r.const_sub(1.0)
+                    .mul(w[18])
+                    .clamp_max(30.0)
+                    .exp()
+                    .sub_const(1.0),
+            )
+            .add_const(1.0);
+        let s_sht = sf_sh.max(s.mul(si_sh));
+
+        let coef = Dual35::constant(1.0)
+            .sub(w[26].mul(w[25].neg().mul(delta_t).exp()))
+            .clamp(0.0, 1.0);
+        coef.mul(s_lng)
+            .add(Dual35::constant(1.0).sub(coef).mul(s_sht))
+            .clamp(S_MIN as f64, S_MAX as f64)
+    }
+
+    fn fsrs7_interval_differentiable_dual(
+        s: Dual35,
+        target: f64,
+        n_newton: usize,
+        w: &[f32],
+        w_dual: &[Dual35],
+    ) -> Dual35 {
+        let s_f = s.value.max(1e-10);
+        let d1 = -(w[27] as f64);
+        let d2 = -(w[28] as f64);
+        let b1 = (w[29] as f64).max(1e-4);
+        let b2 = (w[30] as f64).max(1e-4);
+        let bw1 = (w[31] as f64).max(1e-4);
+        let bw2 = (w[32] as f64).max(1e-4);
+        let sw1 = w[33] as f64;
+        let sw2 = w[34] as f64;
+
+        let c1 = b1.powf(1.0 / d1) - 1.0;
+        let c2 = b2.powf(1.0 / d2) - 1.0;
+        let wt1 = bw1 * s_f.powf(-sw1);
+        let wt2 = bw2 * s_f.powf(sw2);
+        let wts = (wt1 + wt2).max(1e-9);
+
+        let mut u = s_f.ln();
+        for _ in 0..n_newton {
+            u = u.clamp((MIN_T as f64).ln(), (MAX_T as f64).ln());
+            let t = u.exp().clamp(MIN_T as f64, MAX_T as f64);
+            let tos = t / s_f;
+            let i1 = (1.0 + c1 * tos).max(1e-9);
+            let i2 = (1.0 + c2 * tos).max(1e-9);
+            let r = (wt1 * i1.powf(d1) + wt2 * i2.powf(d2)) / wts;
+            let dr1 = d1 * i1.powf(d1 - 1.0) * c1 / s_f;
+            let dr2 = d2 * i2.powf(d2 - 1.0) * c2 / s_f;
+            let drdt = (wt1 * dr1 + wt2 * dr2) / wts;
+            let dfdu = (drdt * t).min(-1e-12);
+            u -= (r - target) / dfdu;
+        }
+
+        let t_star = u.exp().clamp(MIN_T as f64, MAX_T as f64);
+        let residual = fsrs7_fc_r_dual(Dual35::constant(t_star), s, w_dual).sub_const(target);
+        let (_, drdt_s) = fsrs7_fc_r_and_drdt_scalar(t_star, s.value, w);
+        let dfdu_s = (drdt_s * t_star).clamp(-1e9, -1e-9);
+        Dual35::constant(t_star.ln())
+            .sub(residual.div_const(dfdu_s))
+            .clamp((MIN_T as f64).ln(), (MAX_T as f64).ln())
+            .exp()
+    }
+
+    fn fsrs7_interval_growth_penalty_dual(
+        w: &[f32],
+        w_dual: &[Dual35],
+        n_reviews: usize,
+        target_dr: f64,
+        n_newton: usize,
+    ) -> Dual35 {
+        let mut s = w_dual[2].clamp(S_MIN as f64, S_MAX as f64);
+        let init_d4 = fsrs7_init_d_dual(4.0, w_dual);
+        let mut d = fsrs7_init_d_dual(3.0, w_dual);
+        let mut prev_interval: Option<Dual35> = None;
+        let mut best_ratio: Option<Dual35> = None;
+        let mut best_val = f64::NEG_INFINITY;
+        for _ in 0..n_reviews {
+            let t = fsrs7_interval_differentiable_dual(s, target_dr, n_newton, w, w_dual);
+            if let Some(prev) = prev_interval {
+                if prev.value >= ONE_DAY as f64 {
+                    let ratio = t.div(prev);
+                    if ratio.value > best_val {
+                        best_val = ratio.value;
+                        best_ratio = Some(ratio);
+                    }
+                }
+            }
+            prev_interval = Some(t);
+            s = fsrs7_next_s_good_dual(s, d, t, w_dual);
+            d = fsrs7_next_d_good_dual(d, init_d4);
+        }
+        if let Some(ratio) = best_ratio {
+            ratio.powf(2.0)
+        } else {
+            Dual35::constant(0.0)
+        }
+    }
+
+    fn fsrs7_short_interval_penalty_dual(
+        w: &[f32],
+        w_dual: &[Dual35],
+        n_reviews: usize,
+        n_newton: usize,
+        target_drs: &[f32],
+    ) -> Dual35 {
+        let mut penalty_sum = Dual35::constant(0.0);
+        let mut penalty_count = 0usize;
+        for &target_dr in target_drs {
+            let mut s = w_dual[2].clamp(S_MIN as f64, S_MAX as f64);
+            let init_d4 = fsrs7_init_d_dual(4.0, w_dual);
+            let mut d = fsrs7_init_d_dual(3.0, w_dual);
+            let mut short_sum = Dual35::constant(0.0);
+            let mut short_count = 0usize;
+            for _ in 0..n_reviews {
+                let t =
+                    fsrs7_interval_differentiable_dual(s, target_dr as f64, n_newton, w, w_dual);
+                if t.value < ONE_DAY as f64 {
+                    short_sum = short_sum.add(t);
+                    short_count += 1;
+                }
+                s = fsrs7_next_s_good_dual(s, d, t, w_dual);
+                d = fsrs7_next_d_good_dual(d, init_d4);
+            }
+            if short_count == 0 {
+                continue;
+            }
+            let avg_t = short_sum
+                .div_const(short_count as f64)
+                .clamp_min(MIN_T as f64);
+            let inv_x = avg_t.powf(-1.0);
+            let penalty = inv_x.clamp_min(INV_C as f64).sub_const(INV_C as f64);
+            penalty_sum = penalty_sum.add(penalty);
+            penalty_count += 1;
+        }
+        if penalty_count == 0 {
+            Dual35::constant(0.0)
+        } else {
+            penalty_sum.div_const(penalty_count as f64)
+        }
+    }
+
+    pub(crate) fn schedule_penalty_value_and_grad(
+        w: &[f32],
+        batch_size: usize,
+    ) -> (f64, [f64; GRAD_LEN]) {
+        if w.len() < PARAM_LEN {
+            return (0.0, [0.0; GRAD_LEN]);
+        }
+        let w_dual = dual_weights(w);
+        let mut p1 = fsrs7_interval_growth_penalty_dual(
+            w,
+            &w_dual,
+            PENALTY_N_REVIEWS,
+            PENALTY_TARGET_DR as f64,
+            PENALTY_N_NEWTON,
+        );
+        if !p1.value.is_finite() {
+            p1 = Dual35::constant(0.0);
+        }
+        let mut p2 = fsrs7_short_interval_penalty_dual(
+            w,
+            &w_dual,
+            PENALTY_N_REVIEWS,
+            PENALTY_N_NEWTON,
+            &PENALTY_TARGET_DRS,
+        );
+        if !p2.value.is_finite() {
+            p2 = Dual35::constant(0.0);
+        }
+        let penalty = p1
+            .mul_const(PENALTY_W_1)
+            .add(p2.mul_const(PENALTY_W_2))
+            .mul_const(batch_size as f64);
+        if !penalty.value.is_finite() {
+            return (0.0, [0.0; GRAD_LEN]);
+        }
+        let mut grad = penalty.grad;
+        for g in &mut grad {
+            if !g.is_finite() {
+                *g = 0.0;
+            }
+        }
+        (penalty.value, grad)
+    }
+
+    pub(crate) fn maybe_schedule_penalty_value_and_grad(
+        w: &[f32],
+        batch_size: usize,
+        enable_sched_penalties: bool,
+    ) -> (f64, [f64; GRAD_LEN]) {
+        if enable_sched_penalties {
+            schedule_penalty_value_and_grad(w, batch_size)
+        } else {
+            (0.0, [0.0; GRAD_LEN])
+        }
+    }
+}
+
+type B = NdArray<f32>;
+
+const L2_PENALTY_WEIGHT: f64 = training_v7::PENALTY_W_L2;
+const PENALTY_GRAD_LEN: usize = training_v7::GRAD_LEN;
+// Match the CUDA curve's effective range (p = 1e-5 + (1-2e-5)*retention). The old
+// 1e-4/0.9999 training clamp was tighter than CUDA and damped extreme-error gradients.
+const MIN_RETRIEVABILITY: f32 = 1e-5;
+const MAX_RETRIEVABILITY: f32 = 1.0 - 1e-5;
+
+type SchedulePenaltyFn = fn(&[f32], usize, bool) -> (f64, [f64; PENALTY_GRAD_LEN]);
+type L2PenaltyFn = fn(&[f32], &[f32], usize, usize, f64, &[f32]) -> (f64, Vec<f32>);
+
+fn schedule_penalty_fn() -> SchedulePenaltyFn {
+    training_v7::maybe_schedule_penalty_value_and_grad
+}
+
+fn l2_penalty_fn() -> L2PenaltyFn {
+    training_v7::l2_penalty_value_and_grad
+}
+
+// ========== ModelConfig ==========
+
+#[derive(Config, Debug, Default)]
+pub struct ModelConfig {
+    #[config(default = false)]
+    pub freeze_initial_stability: bool,
+    pub initial_stability: Option<[f32; 4]>,
+    pub initial_forgetting_curve: Option<[f32; 8]>,
+    #[config(default = false)]
+    pub freeze_short_term_stability: bool,
+    #[config(default = 1)]
+    pub num_relearning_steps: usize,
+}
+
+// ========== CosineAnnealingLR ==========
+
+#[derive(Clone, Debug)]
+pub(crate) struct CosineAnnealingLR {
+    t_max: f64,
+    eta_min: f64,
+    init_lr: LearningRate,
+    step_count: f64,
+    current_lr: LearningRate,
+}
+
+impl CosineAnnealingLR {
+    pub const fn init(t_max: f64, init_lr: LearningRate) -> Self {
+        Self {
+            t_max,
+            eta_min: 0.0,
+            init_lr,
+            step_count: -1.0,
+            current_lr: init_lr,
+        }
+    }
+}
+
+impl LrScheduler for CosineAnnealingLR {
+    type Record<B: Backend> = usize;
+
+    fn step(&mut self) -> LearningRate {
+        self.step_count += 1.0;
+        use std::f64::consts::PI;
+        fn cosine_annealing_lr(
+            init_lr: LearningRate,
+            lr: LearningRate,
+            step_count: f64,
+            t_max: f64,
+            eta_min: f64,
+        ) -> LearningRate {
+            if step_count == 0.0 {
+                init_lr
+            } else if (step_count - 1.0 - t_max) % (2.0 * t_max) == 0.0 {
+                (init_lr - eta_min) * (1.0 - f64::cos(PI / t_max)) / 2.0
+            } else {
+                ((1.0 + f64::cos(PI * step_count / t_max))
+                    / (1.0 + f64::cos(PI * (step_count - 1.0) / t_max)))
+                .mul_add(lr - eta_min, eta_min)
+            }
+        }
+        self.current_lr = cosine_annealing_lr(
+            self.init_lr,
+            self.current_lr,
+            self.step_count,
+            self.t_max,
+            self.eta_min,
+        );
+        self.current_lr
+    }
+
+    fn to_record<B: Backend>(&self) -> Self::Record<B> {
+        self.step_count as usize
+    }
+
+    fn load_record<B: Backend>(mut self, record: Self::Record<B>) -> Self {
+        self.step_count = record as LearningRate;
+        self
+    }
+}
+
+// ========== Parameter Clipper ==========
+
+pub(crate) fn parameter_clipper<B: Backend>(
+    parameters: Param<Tensor<B, 1>>,
+    enable_short_term: bool,
+) -> Param<Tensor<B, 1>> {
+    let (id, val) = parameters.consume();
+    let clipped = clip_parameters(&val.to_data().to_vec().unwrap());
+    // Dual-trace FSRS-7 has no separate short-term toggle (the old w[26] transition
+    // weight is gone); the fast trace is intrinsic. enable_short_term is kept in the
+    // signature for call-site compatibility but no longer zeros any parameter.
+    let _ = enable_short_term;
+    Param::initialized(
+        id,
+        Tensor::from_data(TensorData::new(clipped, val.shape()), &val.device()).require_grad(),
+    )
+}
+
+// ========== FSRSItem and FSRSReview ==========
+
+/// Stores a list of reviews for a card, in chronological order. Each FSRSItem corresponds
+/// to a single review, but contains the previous reviews of the card as well, after the
+/// first one.
+/// When used during review, the last item should include the correct delta_t, but
+/// the provided rating is ignored as all four ratings are returned by .next_states()
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+pub struct FSRSItem {
+    pub reviews: Vec<FSRSReview>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+pub struct FSRSReview {
+    /// 1-4
+    pub rating: u32,
+    /// The number of days that passed (can be fractional).
+    /// # Warning
+    /// `delta_t` for item first(initial) review must be 0
+    pub delta_t: f32,
+}
+
+const LONG_TERM_DELTA_T_BUCKET_DAYS: f32 = 1.0;
+
+pub(crate) fn bucket_long_term_delta_t(delta_t: f32) -> f32 {
+    if !delta_t.is_finite() {
+        return 1.0;
+    }
+    let clamped = delta_t.max(1.0);
+    (clamped / LONG_TERM_DELTA_T_BUCKET_DAYS).floor() * LONG_TERM_DELTA_T_BUCKET_DAYS
+}
+
+impl FSRSItem {
+    // The previous reviews done before the current one.
+    pub(crate) fn history(&self) -> impl Iterator<Item = &FSRSReview> {
+        self.reviews.iter().take(self.reviews.len() - 1)
+    }
+
+    pub(crate) fn current(&self) -> &FSRSReview {
+        self.reviews.last().unwrap()
+    }
+
+    pub fn long_term_review_cnt(&self) -> usize {
+        self.reviews
+            .iter()
+            .filter(|review| review.delta_t >= 1.0)
+            .count()
+    }
+
+    pub(crate) fn first_long_term_review(&self) -> FSRSReview {
+        *self
+            .reviews
+            .iter()
+            .find(|review| review.delta_t >= 1.0)
+            .expect("Invalid FSRS item: at least one review with delta_t >= 1.0 is required")
+    }
+
+    pub(crate) fn r_matrix_index(&self) -> (u32, u32, u32) {
+        let delta_t = self.current().delta_t as f64;
+        let delta_t_bin = (2.48 * 3.62f64.powf(delta_t.log(3.62).floor()) * 100.0).round() as u32;
+        let length = self.long_term_review_cnt() as f64 + 1.0;
+        let length_bin = (1.99 * 1.89f64.powf(length.log(1.89).floor())).round() as u32;
+        let lapse = self
+            .history()
+            .filter(|review| review.rating == 1 && review.delta_t >= 1.0)
+            .count();
+        if lapse == 0 {
+            return (delta_t_bin, length_bin, 0);
+        }
+        let lapse_bin = (1.65 * 1.73f64.powf((lapse as f64).log(1.73).floor())).round() as u32;
+        (delta_t_bin, length_bin, lapse_bin)
+    }
+}
+
+pub fn filter_outlier(
+    dataset_for_initialization: Vec<FSRSItem>,
+    mut trainset: Vec<FSRSItem>,
+) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
+    let to_key = |delta_t: f32| bucket_long_term_delta_t(delta_t).to_bits();
+    let from_key = |key: u32| f32::from_bits(key);
+    let mut groups = HashMap::<u32, HashMap<u32, Vec<FSRSItem>>>::new();
+
+    for item in dataset_for_initialization.into_iter() {
+        let first_review = item.reviews.first().unwrap();
+        let first_long_term_review = item.first_long_term_review();
+        let rating_group = groups.entry(first_review.rating).or_default();
+        let delta_t_group = rating_group
+            .entry(to_key(first_long_term_review.delta_t))
+            .or_default();
+        delta_t_group.push(item);
+    }
+
+    let mut filtered_items = vec![];
+    let mut removed_pairs: [HashSet<_>; 5] = Default::default();
+
+    for (rating, delta_t_groups) in groups.into_iter().sorted_by_key(|&(k, _)| k) {
+        let mut sub_groups = delta_t_groups.into_iter().collect::<Vec<_>>();
+
+        sub_groups.sort_by(|(delta_t_a, subv_a), (delta_t_b, subv_b)| {
+            subv_b
+                .len()
+                .cmp(&subv_a.len())
+                .then(from_key(*delta_t_b).total_cmp(&from_key(*delta_t_a)))
+        });
+
+        let total = sub_groups.iter().map(|(_, vec)| vec.len()).sum::<usize>();
+        let mut has_been_removed = 0;
+
+        for (delta_t, sub_group) in sub_groups.iter().rev() {
+            if has_been_removed + sub_group.len() >= 20.max(total / 20) {
+                if sub_group.len() >= 6
+                    && from_key(*delta_t) <= if rating != 4 { 100.0 } else { 365.0 }
+                {
+                    filtered_items.extend_from_slice(sub_group);
+                } else {
+                    removed_pairs[rating as usize].insert(*delta_t);
+                }
+            } else {
+                has_been_removed += sub_group.len();
+                removed_pairs[rating as usize].insert(*delta_t);
+            }
+        }
+    }
+    trainset.retain(|item| {
+        if item.long_term_review_cnt() == 0 {
+            true
+        } else {
+            !removed_pairs[item.reviews[0].rating as usize]
+                .contains(&to_key(item.first_long_term_review().delta_t))
+        }
+    });
+    (filtered_items, trainset)
+}
+
+// ========== Dataset Types ==========
+
+#[derive(Debug, Clone)]
+pub(crate) struct WeightedFSRSItem {
+    pub weight: f32,
+    pub item: FSRSItem,
+}
+
+#[derive(Clone)]
+pub(crate) struct FSRSBatcher<B: Backend> {
+    _backend: PhantomData<B>,
+}
+
+impl<B: Backend> FSRSBatcher<B> {
+    pub const fn new() -> Self {
+        Self {
+            _backend: PhantomData,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FSRSBatch<B: Backend> {
+    pub t_historys: Tensor<B, 2, Float>,
+    pub r_historys: Tensor<B, 2, Float>,
+    pub delta_ts: Tensor<B, 1, Float>,
+    pub labels: Tensor<B, 1, Int>,
+    pub weights: Tensor<B, 1, Float>,
+}
+
+impl<B: Backend> Batcher<B, WeightedFSRSItem, FSRSBatch<B>> for FSRSBatcher<B> {
+    fn batch(&self, weighted_items: Vec<WeightedFSRSItem>, device: &B::Device) -> FSRSBatch<B> {
+        let pad_size = weighted_items
+            .iter()
+            .map(|x| x.item.reviews.len())
+            .max()
+            .expect("FSRSItem is empty")
+            - 1;
+
+        let (time_histories, rating_histories) = weighted_items
+            .iter()
+            .map(|weighted_item| {
+                let (mut delta_t, mut rating): (Vec<_>, Vec<_>) = weighted_item
+                    .item
+                    .history()
+                    .map(|r| (r.delta_t, r.rating))
+                    .unzip();
+                delta_t.resize(pad_size, 0.0);
+                rating.resize(pad_size, 0);
+                let delta_t = Tensor::<B, 2>::from_floats(
+                    TensorData::new(
+                        delta_t,
+                        Shape {
+                            dims: vec![1, pad_size],
+                        },
+                    ),
+                    device,
+                );
+                let rating = Tensor::<B, 2>::from_data(
+                    TensorData::new(
+                        rating,
+                        Shape {
+                            dims: vec![1, pad_size],
+                        },
+                    ),
+                    device,
+                );
+                (delta_t, rating)
+            })
+            .unzip();
+
+        let (delta_ts, labels, weights) = weighted_items
+            .iter()
+            .map(|weighted_item| {
+                let current = weighted_item.item.current();
+                let delta_t: Tensor<B, 1> = Tensor::from_floats([current.delta_t], device);
+                let label = match current.rating {
+                    1 => 0,
+                    _ => 1,
+                };
+                let label: Tensor<B, 1, Int> = Tensor::from_ints([label], device);
+                let weight: Tensor<B, 1> = Tensor::from_floats([weighted_item.weight], device);
+                (delta_t, label, weight)
+            })
+            .multiunzip();
+
+        let t_historys = Tensor::cat(time_histories, 0).transpose().to_device(device);
+        let r_historys = Tensor::cat(rating_histories, 0)
+            .transpose()
+            .to_device(device);
+        let delta_ts = Tensor::cat(delta_ts, 0).to_device(device);
+        let labels = Tensor::cat(labels, 0).to_device(device);
+        let weights = Tensor::cat(weights, 0).to_device(device);
+
+        FSRSBatch {
+            t_historys,
+            r_historys,
+            delta_ts,
+            labels,
+            weights,
+        }
+    }
+}
+
+pub(crate) struct FSRSDataset {
+    pub(crate) items: Vec<WeightedFSRSItem>,
+}
+
+impl Dataset<WeightedFSRSItem> for FSRSDataset {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn get(&self, index: usize) -> Option<WeightedFSRSItem> {
+        self.items.get(index).cloned()
+    }
+}
+
+impl From<Vec<WeightedFSRSItem>> for FSRSDataset {
+    fn from(items: Vec<WeightedFSRSItem>) -> Self {
+        Self {
+            items: sort_items_by_review_length(items),
+        }
+    }
+}
+
+// ========== Batch Shuffle ==========
+
+#[derive(Clone)]
+pub(crate) struct BatchTensorDataset<B: Backend> {
+    dataset: Vec<FSRSBatch<B>>,
+}
+
+impl<B: Backend> BatchTensorDataset<B> {
+    pub fn new(dataset: FSRSDataset, batch_size: usize) -> Self {
+        let device = B::Device::default();
+        let batcher = FSRSBatcher::<B>::new();
+        let dataset = dataset
+            .items
+            .chunks(batch_size)
+            .map(|items| batcher.batch(items.to_vec(), &device))
+            .collect();
+        Self { dataset }
+    }
+}
+
+impl<B: Backend> BatchTensorDataset<B> {
+    fn get(&self, index: usize) -> Option<FSRSBatch<B>> {
+        self.dataset.get(index).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.dataset.len()
+    }
+}
+
+pub(crate) struct ShuffleDataLoader<B: Backend> {
+    dataset: BatchTensorDataset<B>,
+    rng: Mutex<StdRng>,
+}
+
+impl<B: Backend> ShuffleDataLoader<B> {
+    pub fn new(dataset: BatchTensorDataset<B>, seed: u64) -> Self {
+        Self {
+            dataset,
+            rng: Mutex::new(StdRng::seed_from_u64(seed)),
+        }
+    }
+}
+
+pub(crate) struct ShuffleDataLoaderIterator<B: Backend> {
+    current_index: usize,
+    indices: Vec<usize>,
+    dataset: BatchTensorDataset<B>,
+}
+
+impl<B: Backend> ShuffleDataLoaderIterator<B> {
+    pub(crate) fn new(dataset: BatchTensorDataset<B>, indices: Vec<usize>) -> Self {
+        Self {
+            current_index: 0,
+            indices,
+            dataset,
+        }
+    }
+}
+
+impl<B: Backend> Iterator for ShuffleDataLoaderIterator<B> {
+    type Item = FSRSBatch<B>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(index) = self.indices.get(self.current_index) {
+            self.current_index += 1;
+            return self.dataset.get(*index);
+        }
+        None
+    }
+}
+
+impl<B: Backend> DataLoaderIterator<FSRSBatch<B>> for ShuffleDataLoaderIterator<B> {
+    fn progress(&self) -> Progress {
+        Progress::new(self.current_index, self.dataset.len())
+    }
+}
+
+impl<B: Backend> ShuffleDataLoader<B> {
+    pub(crate) fn iter(&self) -> ShuffleDataLoaderIterator<B> {
+        let mut indices: Vec<_> = (0..self.dataset.len()).collect();
+        indices.shuffle(&mut *self.rng.lock().unwrap());
+        ShuffleDataLoaderIterator::new(self.dataset.clone(), indices)
+    }
+}
+
+// ========== Dataset Helper Functions ==========
+
+pub(crate) fn sort_items_by_review_length(
+    mut weighted_items: Vec<WeightedFSRSItem>,
+) -> Vec<WeightedFSRSItem> {
+    weighted_items.sort_by_cached_key(|weighted_item| weighted_item.item.reviews.len());
+    weighted_items
+}
+
+/// The input items should be sorted by the review timestamp.
+pub(crate) fn recency_weighted_fsrs_items(items: Vec<FSRSItem>) -> Vec<WeightedFSRSItem> {
+    // Denominator is the train-set size n (NOT n-1), matching CUDA gradient_weight:
+    // review_ord_lin = review_ord / training_set_size, review_ord 0-based (0..n-1).
+    let length = (items.len() as f32).max(1.0);
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(idx, item)| WeightedFSRSItem {
+            // iter-66 champion recency weighting: C0 + (1 - C0) * (idx/n)^EXP,
+            // C0 = 0.0666667, EXP = 11.25.
+            weight: 0.0666667 + 0.9333333 * (idx as f32 / length).powf(11.25),
+            item,
+        })
+        .collect()
+}
+
+pub(crate) fn prepare_training_data(items: Vec<FSRSItem>) -> (Vec<FSRSItem>, Vec<FSRSItem>) {
+    let (mut dataset_for_initialization, mut trainset) = items
+        .clone()
+        .into_iter()
+        .partition(|item| item.long_term_review_cnt() == 1);
+    if std::env::var("FSRS_NO_OUTLIER").is_err() {
+        (dataset_for_initialization, trainset) = filter_outlier(dataset_for_initialization, items);
+    }
+    (dataset_for_initialization, trainset)
+}
+
+// ========== BCE Loss ==========
+
+pub struct BCELoss<B: Backend> {
+    backend: PhantomData<B>,
+}
+
+impl<B: Backend> BCELoss<B> {
+    pub const fn new() -> Self {
+        Self {
+            backend: PhantomData,
+        }
+    }
+    pub fn forward(
+        &self,
+        retrievability: Tensor<B, 1>,
+        labels: Tensor<B, 1>,
+        weights: Tensor<B, 1>,
+        mean: Reduction,
+    ) -> Tensor<B, 1> {
+        let loss = (labels.clone() * retrievability.clone().log()
+            + (-labels + 1) * (-retrievability + 1).log())
+            * weights.clone();
+        match mean {
+            Reduction::Mean => loss.mean().neg(),
+            Reduction::Sum => loss.sum().neg(),
+            Reduction::Auto => (loss.sum() / weights.sum()).neg(),
+        }
+    }
+}
+
+impl<B: Backend> Model<B> {
+    pub fn forward_classification(
+        &self,
+        t_historys: Tensor<B, 2>,
+        r_historys: Tensor<B, 2>,
+        delta_ts: Tensor<B, 1>,
+        labels: Tensor<B, 1, Int>,
+        weights: Tensor<B, 1>,
+        reduce: Reduction,
+    ) -> Tensor<B, 1> {
+        let state = self.forward(t_historys, r_historys, None);
+        let retrievability = self
+            .power_forgetting_curve(
+                delta_ts,
+                state.stability,
+                state.stability_fast,
+                state.difficulty,
+            )
+            .clamp(MIN_RETRIEVABILITY, MAX_RETRIEVABILITY);
+        BCELoss::new().forward(retrievability, labels.float(), weights, reduce)
+    }
+}
+
+impl<B: AutodiffBackend> Model<B> {
+    fn add_manual_weight_gradient(
+        &self,
+        mut gradients: B::Gradients,
+        manual_grad: &[f32],
+    ) -> B::Gradients {
+        let grad_tensor = self.w.grad(&gradients).unwrap();
+        let device = grad_tensor.device();
+        let grad_len = grad_tensor.dims()[0];
+        let mut data = vec![0.0f32; grad_len];
+        for (dst, src) in data.iter_mut().zip(manual_grad.iter()) {
+            *dst = *src;
+        }
+        let manual_tensor = Tensor::from_floats(data.as_slice(), &device);
+        let updated_grad = grad_tensor + manual_tensor;
+        self.w.grad_remove(&mut gradients);
+        self.w.grad_replace(&mut gradients, updated_grad);
+        gradients
+    }
+
+    fn freeze_initial_stability(&self, mut grad: B::Gradients) -> B::Gradients {
+        let grad_tensor = self.w.grad(&grad).unwrap();
+        let device = grad_tensor.device();
+        let updated_grad_tensor = grad_tensor.slice_assign([0..4], Tensor::zeros([4], &device));
+
+        self.w.grad_remove(&mut grad);
+        self.w.grad_replace(&mut grad, updated_grad_tensor);
+        grad
+    }
+
+    fn freeze_short_term_stability(&self, mut grad: B::Gradients) -> B::Gradients {
+        let grad_tensor = self.w.grad(&grad).unwrap();
+        let device = grad_tensor.device();
+        // Dual-trace layout: the short-term stability-after-review params are 16..25
+        // (9 params). Unused in the timed paths (enable_short_term is always true).
+        let updated_grad_tensor = grad_tensor.slice_assign([15..23], Tensor::zeros([8], &device));
+
+        self.w.grad_remove(&mut grad);
+        self.w.grad_replace(&mut grad, updated_grad_tensor);
+        grad
+    }
+}
+
+// ========== Progress Types ==========
+
+#[derive(Debug, Default, Clone)]
+pub struct ProgressState {
+    pub epoch: usize,
+    pub epoch_total: usize,
+    pub items_processed: usize,
+    pub items_total: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct CombinedProgressState {
+    pub want_abort: bool,
+    pub splits: Vec<ProgressState>,
+    finished: bool,
+}
+
+impl CombinedProgressState {
+    pub fn new_shared() -> Arc<Mutex<Self>> {
+        Default::default()
+    }
+
+    pub fn current(&self) -> usize {
+        self.splits.iter().map(|s| s.current()).sum()
+    }
+
+    pub fn total(&self) -> usize {
+        self.splits.iter().map(|s| s.total()).sum()
+    }
+
+    pub const fn finished(&self) -> bool {
+        self.finished
+    }
+}
+
+#[derive(Clone)]
+pub struct ProgressCollector {
+    pub state: Arc<Mutex<CombinedProgressState>>,
+    pub interrupter: TrainingInterrupter,
+    /// The index of the split we should update.
+    pub index: usize,
+}
+
+impl ProgressCollector {
+    pub fn new(state: Arc<Mutex<CombinedProgressState>>, index: usize) -> Self {
+        Self {
+            state,
+            interrupter: Default::default(),
+            index,
+        }
+    }
+}
+
+impl ProgressState {
+    pub const fn current(&self) -> usize {
+        self.epoch.saturating_sub(1) * self.items_total + self.items_processed
+    }
+
+    pub const fn total(&self) -> usize {
+        self.epoch_total * self.items_total
+    }
+}
+
+impl MetricsRenderer for ProgressCollector {
+    fn update_train(&mut self, _state: MetricState) {}
+
+    fn update_valid(&mut self, _state: MetricState) {}
+
+    fn render_train(&mut self, item: TrainingProgress) {
+        let mut info = self.state.lock().unwrap();
+        let split = &mut info.splits[self.index];
+        split.epoch = item.epoch;
+        split.epoch_total = item.epoch_total;
+        split.items_processed = item.progress.items_processed;
+        split.items_total = item.progress.items_total;
+        if info.want_abort {
+            self.interrupter.stop();
+        }
+    }
+
+    fn render_valid(&mut self, _item: TrainingProgress) {}
+}
+
+// ========== Training Config ==========
+
+#[derive(Config)]
+pub(crate) struct TrainingConfig {
+    pub model: ModelConfig,
+    pub optimizer: AdamConfig,
+    #[config(default = false)]
+    pub enable_sched_penalties: bool,
+    #[config(default = 9)]
+    pub num_epochs: usize,
+    #[config(default = 256)]
+    pub batch_size: usize,
+    #[config(default = 2023)]
+    pub seed: u64,
+    #[config(default = 0.0282)]
+    pub learning_rate: f64,
+    #[config(default = 1024)]
+    pub max_seq_len: usize,
+}
+
+// ========== ComputeParametersInput ==========
+
+/// Input parameters for computing FSRS parameters
+#[derive(Clone, Debug)]
+pub struct ComputeParametersInput {
+    /// The training set containing review history
+    pub train_set: Vec<FSRSItem>,
+    /// Optional progress tracking
+    pub progress: Option<Arc<Mutex<CombinedProgressState>>>,
+    /// Whether to enable short-term memory parameters
+    pub enable_short_term: bool,
+    /// Whether to enable FSRS-7 schedule penalties (penalty 1 & 2)
+    pub enable_sched_penalties: bool,
+    /// Number of relearning steps
+    pub num_relearning_steps: Option<usize>,
+}
+
+impl Default for ComputeParametersInput {
+    fn default() -> Self {
+        Self {
+            train_set: Vec::new(),
+            progress: None,
+            enable_short_term: true,
+            enable_sched_penalties: false,
+            num_relearning_steps: None,
+        }
+    }
+}
+
+fn normalize_training_set(train_set: Vec<FSRSItem>) -> Vec<FSRSItem> {
+    train_set
+        .into_iter()
+        .map(|mut item| {
+            for review in &mut item.reviews {
+                review.delta_t = review.delta_t.max(0.0);
+            }
+            item
+        })
+        .collect()
+}
+
+/// Computes optimized parameters for the FSRS model based on training data.
+///
+/// This function trains the model on the provided dataset and returns optimized parameters.
+///
+/// # Arguments
+/// * `input` - Input parameters including the training dataset and configuration
+///
+/// # Returns
+/// A `Result<Vec<f32>>` containing the optimized parameters
+pub fn compute_parameters(
+    ComputeParametersInput {
+        train_set,
+        progress,
+        enable_short_term,
+        enable_sched_penalties,
+        num_relearning_steps,
+        ..
+    }: ComputeParametersInput,
+) -> Result<Vec<f32>> {
+    let finish_progress = || {
+        if let Some(progress) = &progress {
+            progress.lock().unwrap().finished = true;
+        }
+    };
+
+    let train_set = normalize_training_set(train_set);
+    let (_, train_set) = prepare_training_data(train_set);
+    if train_set.len() < 8 {
+        finish_progress();
+        return Ok(DEFAULT_PARAMETERS.to_vec());
+    }
+
+    let initialized_parameters = DEFAULT_PARAMETERS.to_vec();
+    if train_set.len() < 64 {
+        finish_progress();
+        return Ok(initialized_parameters);
+    }
+    let config = TrainingConfig::new(
+        ModelConfig {
+            freeze_initial_stability: !enable_short_term,
+            initial_stability: None,
+            initial_forgetting_curve: None,
+            freeze_short_term_stability: !enable_short_term,
+            num_relearning_steps: num_relearning_steps.unwrap_or(1),
+        },
+        AdamConfig::new()
+            .with_beta_1(0.55)
+            .with_beta_2(0.9942)
+            .with_epsilon(1e-8),
+    )
+    .with_enable_sched_penalties(enable_sched_penalties);
+    let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
+    weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
+
+    if let Some(progress) = &progress {
+        let progress_state = ProgressState {
+            epoch_total: config.num_epochs,
+            items_total: weighted_train_set.len(),
+            epoch: 0,
+            items_processed: 0,
+        };
+        progress.lock().unwrap().splits = vec![progress_state];
+    }
+    let model = train::<Autodiff<B>>(
+        weighted_train_set.clone(),
+        weighted_train_set,
+        &initialized_parameters,
+        &config,
+        progress.clone().map(|p| ProgressCollector::new(p, 0)),
+    );
+
+    let optimized_parameters = model
+        .inspect_err(|_e| {
+            finish_progress();
+        })?
+        .w
+        .val()
+        .to_data()
+        .to_vec()
+        .unwrap();
+
+    finish_progress();
+
+    if optimized_parameters
+        .iter()
+        .any(|parameter: &f32| parameter.is_infinite())
+    {
+        return Err(FSRSError::InvalidInput);
+    }
+
+    Ok(optimized_parameters)
+}
+
+pub fn benchmark(
+    ComputeParametersInput {
+        train_set,
+        enable_short_term,
+        enable_sched_penalties,
+        num_relearning_steps,
+        ..
+    }: ComputeParametersInput,
+) -> Vec<f32> {
+    let train_set = normalize_training_set(train_set);
+    let (_, train_set) = prepare_training_data(train_set);
+    let initialized_parameters = DEFAULT_PARAMETERS.to_vec();
+    let mut config = TrainingConfig::new(
+        ModelConfig {
+            freeze_initial_stability: !enable_short_term,
+            initial_stability: None,
+            initial_forgetting_curve: None,
+            freeze_short_term_stability: !enable_short_term,
+            num_relearning_steps: num_relearning_steps.unwrap_or(1),
+        },
+        AdamConfig::new()
+            .with_beta_1(0.55)
+            .with_beta_2(0.9942)
+            .with_epsilon(1e-8),
+    )
+    .with_enable_sched_penalties(enable_sched_penalties);
+    // save RAM and speed up training
+    config.max_seq_len = 64;
+    let mut weighted_train_set = recency_weighted_fsrs_items(train_set);
+    weighted_train_set.retain(|item| item.item.reviews.len() <= config.max_seq_len);
+    let model = train::<Autodiff<B>>(
+        weighted_train_set.clone(),
+        weighted_train_set,
+        &initialized_parameters,
+        &config,
+        None,
+    );
+    let parameters: Vec<f32> = model.unwrap().w.val().to_data().to_vec::<f32>().unwrap();
+    parameters
+}
+
+fn train<B: AutodiffBackend>(
+    train_set: Vec<WeightedFSRSItem>,
+    test_set: Vec<WeightedFSRSItem>,
+    initial_parameters: &[f32],
+    config: &TrainingConfig,
+    progress: Option<ProgressCollector>,
+) -> Result<Model<B>> {
+    B::seed(config.seed);
+
+    // Training data
+    let total_size = train_set.len();
+    let iterations = (total_size / config.batch_size + 1) * config.num_epochs;
+    let batch_dataset =
+        BatchTensorDataset::<B>::new(FSRSDataset::from(train_set), config.batch_size);
+    let dataloader_train = ShuffleDataLoader::new(batch_dataset, config.seed);
+
+    let batch_dataset = BatchTensorDataset::<B::InnerBackend>::new(
+        FSRSDataset::from(test_set.clone()),
+        config.batch_size,
+    );
+    let dataloader_valid = ShuffleDataLoader::new(batch_dataset, config.seed);
+
+    let mut lr_scheduler = CosineAnnealingLR::init(iterations as f64, config.learning_rate);
+    let interrupter = TrainingInterrupter::new();
+    let mut renderer: Box<dyn MetricsRenderer> = match progress {
+        Some(mut progress) => {
+            progress.interrupter = interrupter.clone();
+            Box::new(progress)
+        }
+        None => Box::new(NoProgress {}),
+    };
+
+    let mut model: Model<B> = parameters_to_model::<B>(initial_parameters, &B::Device::default());
+    let schedule_penalty = schedule_penalty_fn();
+    let l2_penalty = l2_penalty_fn();
+    let init_w = model.w.val();
+    let init_w_vec = init_w.to_data().to_vec::<f32>().unwrap();
+    let mut optim = config.optimizer.init::<B, Model<B>>();
+
+    let mut best_loss = f64::INFINITY;
+    let mut best_model = model.clone();
+    for epoch in 1..=config.num_epochs {
+        let mut iterator = dataloader_train.iter();
+        let mut iteration = 0;
+        while let Some(item) = iterator.next() {
+            iteration += 1;
+            let real_batch_size = item.delta_ts.shape().dims[0];
+            let lr = LrScheduler::step(&mut lr_scheduler);
+            let progress = iterator.progress();
+            let l2_weight = L2_PENALTY_WEIGHT;
+            let w_vec = model.w.val().to_data().to_vec::<f32>().unwrap();
+            let (_l2_penalty_value, mut manual_grad) = l2_penalty(
+                &w_vec,
+                &init_w_vec,
+                real_batch_size,
+                total_size,
+                l2_weight,
+                &training_v7::PARAMS_STDDEV,
+            );
+            let (_schedule_value, schedule_grad) =
+                schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
+            let inv_total = 1.0 / total_size as f64;
+            for i in 0..manual_grad.len().min(schedule_grad.len()) {
+                manual_grad[i] += (schedule_grad[i] * inv_total) as f32;
+            }
+            let loss = model.forward_classification(
+                item.t_historys,
+                item.r_historys,
+                item.delta_ts,
+                item.labels,
+                item.weights,
+                Reduction::Sum,
+            );
+            let mut gradients = loss.backward();
+            gradients = model.add_manual_weight_gradient(gradients, &manual_grad);
+            if config.model.freeze_initial_stability {
+                gradients = model.freeze_initial_stability(gradients);
+            }
+            if config.model.freeze_short_term_stability {
+                gradients = model.freeze_short_term_stability(gradients);
+            }
+            let grads = GradientsParams::from_grads(gradients, &model);
+            model = optim.step(lr, model, grads);
+            model.w = parameter_clipper(model.w, !config.model.freeze_short_term_stability);
+            renderer.render_train(TrainingProgress {
+                progress,
+                epoch,
+                epoch_total: config.num_epochs,
+                iteration,
+            });
+
+            if interrupter.should_stop() {
+                break;
+            }
+        }
+
+        if interrupter.should_stop() {
+            break;
+        }
+
+        let model_valid = model.valid();
+        let mut loss_valid = 0.0;
+        for batch in dataloader_valid.iter() {
+            let real_batch_size = batch.delta_ts.shape().dims[0];
+            let l2_weight = L2_PENALTY_WEIGHT;
+            let w_vec = model_valid.w.val().to_data().to_vec::<f32>().unwrap();
+            let (l2_penalty_value, _) = l2_penalty(
+                &w_vec,
+                &init_w_vec,
+                real_batch_size,
+                total_size,
+                l2_weight,
+                &training_v7::PARAMS_STDDEV,
+            );
+            let (schedule_value, _) =
+                schedule_penalty(&w_vec, real_batch_size, config.enable_sched_penalties);
+            let schedule_penalty = schedule_value / total_size as f64;
+            let loss = model_valid.forward_classification(
+                batch.t_historys,
+                batch.r_historys,
+                batch.delta_ts,
+                batch.labels,
+                batch.weights,
+                Reduction::Sum,
+            );
+            let loss = loss.into_scalar().to_f64();
+            loss_valid += loss + l2_penalty_value + schedule_penalty;
+
+            if interrupter.should_stop() {
+                break;
+            }
+        }
+        loss_valid /= test_set.len() as f64;
+        info!("epoch: {:?} loss: {:?}", epoch, loss_valid);
+        if loss_valid < best_loss {
+            best_loss = loss_valid;
+            best_model = model.clone();
+        }
+    }
+
+    info!("best_loss: {:?}", best_loss);
+
+    if interrupter.should_stop() {
+        return Err(FSRSError::Interrupted);
+    }
+
+    Ok(best_model)
+}
+
+struct NoProgress {}
+
+impl MetricsRenderer for NoProgress {
+    fn update_train(&mut self, _state: MetricState) {}
+
+    fn update_valid(&mut self, _state: MetricState) {}
+
+    fn render_train(&mut self, _item: TrainingProgress) {}
+
+    fn render_valid(&mut self, _item: TrainingProgress) {}
+}
