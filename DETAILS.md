@@ -10,7 +10,7 @@ This is the measurement contract for FSRS-Optimizer-Bench. A faster optimizer on
 Keep the model and inputs fixed; otherwise the results are not comparable.
 ## Timing runs
 Run each user **three times per build** and use the minimum Rust-call time for that user. Interference only adds time; the minimum is a less biased estimate of the compute floor. Report the median of per-user times. The supplied `--paired BASELINE CANDIDATE` harness reports the **median of paired per-user ratios** `baseline_ms / candidate_ms`, not the ratio of the two medians. Supply immutable, distinct extension files. Use a separate Cargo target directory for candidate builds so compiling a candidate never overwrites the baseline shared library. Store one output file per model using `--run-name`.
-When the same machine can run both builds concurrently, use paired A/B timing:
+On Windows with at least eight logical CPUs available to the process, the supplied paired harness runs the two builds concurrently on disjoint CPU pairs; it alternates those pairs and start order over the three repetitions. On other systems, use separate single-build runs in alternating order and mark the results unpaired. For paired A/B timing:
 1. Run baseline and candidate on the same user simultaneously on neighboring, disjoint two-logical-CPU blocks.
 2. Run three repetitions; swap CPU blocks and which build starts first between repetitions.
 3. Do not advance to the next user until both builds finish the current user.

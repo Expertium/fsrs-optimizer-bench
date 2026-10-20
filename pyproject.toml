@@ -6,6 +6,7 @@ dependencies = [
     "fsrs-rs-python",
     "numpy",
     "pandas",
+    "psutil",
     "pyarrow>=15",
     "relplot>=1.0",
     "scikit-learn",
@@ -17,5 +18,8 @@ dependencies = [
 package = false
 [tool.uv.sources]
 fsrs-rs-python = { path = "fsrs_rs_python" }
+[dependency-groups]
+dev = ["pytest"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

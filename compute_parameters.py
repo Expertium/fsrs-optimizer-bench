@@ -221,10 +221,10 @@ torch.manual_seed(config.seed)
 
 # Distinct output name so results never collide with benchmark.py's.
 OUTPUT_NAME = f"compute_parameters-{config.get_evaluation_file_name()}"
+if args.paired:
+    OUTPUT_NAME += "-paired"
 if args.run_name:
     OUTPUT_NAME += f"-{args.run_name}"
-if args.paired:
-    OUTPUT_NAME += "-paired-" + (args.run_name or "run")
 
 
 @catch_exceptions
@@ -267,7 +267,10 @@ def process(
 def _paired_worker(extension_path, connection):
     os.environ["FSRS_EXTENSION_PATH"] = str(extension_path)
     import fsrs_rs_python as fsrs_module
+
     connection.send("ready")
+    cached_user = None
+    cached_items = None
     while True:
         command = connection.recv()
         if command is None:
@@ -277,8 +280,15 @@ def _paired_worker(extension_path, connection):
         if cpus is not None:
             _set_cpu_affinity(cpus)
         try:
-            items, _ = convert_to_items(UserDataLoader(config).load_user_data(user_id))
-            if kind == "timed":
+            if user_id != cached_user:
+                cached_items = convert_to_items(
+                    UserDataLoader(config).load_user_data(user_id)
+                )[0]
+                cached_user = user_id
+            items = cached_items
+            if kind == "prepare":
+                connection.send(("prepared", user_id, len(items)))
+            elif kind == "timed":
                 params, elapsed = fsrs_module.FSRS(parameters=[]).compute_parameters(items)
                 connection.send((elapsed * 1000.0, [round(w, 4) for w in params]))
             else:
@@ -286,7 +296,92 @@ def _paired_worker(extension_path, connection):
                 connection.send(scorer.evaluate(items))
         except Exception as exc:
             connection.send(("error", repr(exc)))
+
+
+def _write_json_atomically(path: Path, data: dict) -> None:
+    path.parent.mkdir(exist_ok=True)
+    temporary_path = path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _write_paired_checkpoint(path: Path, metadata: dict, results: dict) -> None:
+    _write_json_atomically(path, {"metadata": metadata, "per_user": results})
+
+
+def _paired_summary(results: dict) -> dict:
+    rows = list(results.values())
+    total_items = sum(row["size"] for row in rows)
+    mean_a = statistics.mean(row["a_logloss"] for row in rows)
+    mean_b = statistics.mean(row["b_logloss"] for row in rows)
+    return {
+        "users": len(rows),
+        "total_items": total_items,
+        "median_speedup": statistics.median(row["a_ms"] / row["b_ms"] for row in rows),
+        "mean_speedup": statistics.mean(row["a_ms"] / row["b_ms"] for row in rows),
+        "median_ms_baseline": statistics.median(row["a_ms"] for row in rows),
+        "median_ms_candidate": statistics.median(row["b_ms"] for row in rows),
+        "mean_logloss_baseline": mean_a,
+        "mean_logloss_candidate": mean_b,
+        "baseline_logloss_in_band": 0.3078 <= mean_a <= 0.3113 if len(rows) == 50 else None,
+        "candidate_logloss_in_band": 0.3078 <= mean_b <= 0.3113 if len(rows) == 50 else None,
+        "full_run": len(rows) == 50,
+        "parameter_hash_diffs": sum(
+            row["a_parameters"] != row["b_parameters"] for row in rows
+        ),
+    }
+
+
+def _write_paired_result(results: dict, metadata: dict) -> None:
+    rows = list(results.values())
+    if not rows:
+        raise RuntimeError("no users were selected for the paired benchmark")
+    summary = _paired_summary(results)
+    if summary["full_run"] and summary["total_items"] != 1_897_936:
+        raise AssertionError(
+            f"expected 1,897,936 paired items, got {summary['total_items']:,}"
+        )
+    result_file = Path("result") / f"{OUTPUT_NAME}.json"
+    _write_json_atomically(
+        result_file,
+        {"summary": summary, "per_user": results, "checkpoint_metadata": metadata},
+    )
+    print(json.dumps(summary, indent=2))
+    if summary["full_run"] and not summary["baseline_logloss_in_band"]:
+        raise AssertionError(
+            f"baseline mean LogLoss {summary['mean_logloss_baseline']:.6f} outside [0.3078, 0.3113]"
+        )
+    if summary["full_run"] and not summary["candidate_logloss_in_band"]:
+        raise AssertionError(
+            f"candidate mean LogLoss {summary['mean_logloss_candidate']:.6f} outside [0.3078, 0.3113]"
+        )
+
+
 def _run_paired_benchmark(baseline_path: str, candidate_path: str) -> None:
+    if sys.platform != "win32" or (os.cpu_count() or 0) < 8:
+        raise RuntimeError(
+            "paired timing currently requires Windows with at least 8 logical CPUs; "
+            "use alternating single-build runs elsewhere"
+        )
+    if Path(baseline_path).resolve() == Path(candidate_path).resolve():
+        raise ValueError("baseline and candidate must be different extension files")
+    if args.max_user_id is not None and args.max_user_id < 50:
+        print(
+            "Warning: fewer than 50 users selected; the full-run accuracy gate "
+            "will not be evaluated.",
+            file=sys.stderr,
+            flush=True,
+        )
+    try:
+        import psutil
+    except ImportError as exc:
+        raise RuntimeError("paired timing requires the psutil project dependency") from exc
+
+    available_cpus = sorted(psutil.Process().cpu_affinity())
+    if len(available_cpus) < 4:
+        raise RuntimeError(
+            f"paired timing needs 4 available logical CPUs, found {len(available_cpus)}"
+        )
     baseline_path = str(Path(baseline_path).resolve())
     candidate_path = str(Path(candidate_path).resolve())
     if not Path(baseline_path).is_file() or not Path(candidate_path).is_file():
@@ -296,8 +391,50 @@ def _run_paired_benchmark(baseline_path: str, candidate_path: str) -> None:
              if config.max_user_id is None or entry.as_py() <= config.max_user_id]
     _size_rank = {uid: i for i, uid in enumerate(USERS_BY_SIZE_DESC)}
     users.sort(key=lambda uid: (_size_rank.get(uid, len(_size_rank)), uid))
-    if config.max_user_id == 50 and len(users) != 50:
-        raise ValueError(f"expected 50 users, got {len(users)}")
+    if config.max_user_id == 50 and (len(users) != 50 or set(users) != set(range(1, 51))):
+        raise ValueError(f"expected exactly users 1-50, got {len(users)} users")
+    if config.max_user_id is None or config.max_user_id >= 50:
+        missing_users = set(range(1, 51)) - set(users)
+        if missing_users:
+            raise ValueError(
+                f"canonical benchmark users are missing: {sorted(missing_users)}"
+            )
+    checkpoint_file = Path("result") / f"{OUTPUT_NAME}-partial.json"
+    results = {}
+    if checkpoint_file.is_file():
+        try:
+            saved = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+            if saved.get("metadata") == {
+                "baseline_sha256": hashlib.sha256(Path(baseline_path).read_bytes()).hexdigest(),
+                "candidate_sha256": hashlib.sha256(Path(candidate_path).read_bytes()).hexdigest(),
+                "data_path": str(config.data_path.resolve()),
+                "users": users,
+                "timing_repeats": TIMING_REPEATS,
+            }:
+                selected_users = set(users)
+                results = {
+                    int(user_id): row
+                    for user_id, row in saved.get("per_user", {}).items()
+                    if int(user_id) in selected_users
+                    and len(row.get("a_runs_ms", [])) == TIMING_REPEATS
+                    and len(row.get("b_runs_ms", [])) == TIMING_REPEATS
+                    and isinstance(row.get("a_logloss"), (int, float))
+                    and isinstance(row.get("b_logloss"), (int, float))
+                }
+        except (OSError, ValueError, TypeError):
+            results = {}
+    checkpoint_metadata = {
+        "baseline_sha256": hashlib.sha256(Path(baseline_path).read_bytes()).hexdigest(),
+        "candidate_sha256": hashlib.sha256(Path(candidate_path).read_bytes()).hexdigest(),
+        "data_path": str(config.data_path.resolve()),
+        "users": users,
+        "timing_repeats": TIMING_REPEATS,
+    }
+    remaining_users = [user_id for user_id in users if user_id not in results]
+    if not remaining_users:
+        print(f"Resuming from completed paired data in {checkpoint_file}", flush=True)
+        _write_paired_result(results, checkpoint_metadata)
+        return
     with tempfile.TemporaryDirectory(prefix="fsrs_paired_") as temp_dir:
         paths = []
         for label, source in (("baseline", baseline_path), ("candidate", candidate_path)):
@@ -309,80 +446,91 @@ def _run_paired_benchmark(baseline_path: str, candidate_path: str) -> None:
             paths.append(staged)
         workers = []
         connections = []
-        for path in paths:
-            parent, child = Pipe()
-            worker = Process(target=_paired_worker, args=(str(path), child))
-            worker.start()
-            workers.append(worker)
-            connections.append(parent)
-        for conn in connections:
-            if conn.recv() != "ready":
-                raise RuntimeError("paired worker failed to initialize")
-        results = {}
-        first_cpu = 4
-        for user_index, user_id in enumerate(users):
-            timings = [[], []]
-            params = [None, None]
-            for repeat in range(TIMING_REPEATS):
-                first_block = [first_cpu, first_cpu + 1]
-                second_block = [first_cpu + 2, first_cpu + 3]
-                swap = repeat % 2
-                blocks = [first_block, second_block]
-                if swap:
-                    blocks.reverse()
-                start_order = [0, 1] if (repeat + user_index) % 2 == 0 else [1, 0]
-                for worker_index in start_order:
-                    connections[worker_index].send(("timed", user_id, blocks[worker_index]))
-                for worker_index in range(2):
-                    reply = connections[worker_index].recv()
-                    if isinstance(reply, tuple) and reply and reply[0] == "error":
-                        raise RuntimeError(f"user {user_id}: {reply[1]}")
-                    milliseconds, params[worker_index] = reply
-                    timings[worker_index].append(milliseconds)
-            results[user_id] = {
-                "a_runs_ms": timings[0], "b_runs_ms": timings[1],
-                "a_ms": min(timings[0]), "b_ms": min(timings[1]),
-                "a_parameters": params[0], "b_parameters": params[1],
-            }
-            for worker_index, connection in enumerate(connections):
-                connection.send(("score", user_id, None, params[worker_index]))
-            for worker_index, connection in enumerate(connections):
-                loss = connection.recv()
-                if isinstance(loss, tuple) and loss and loss[0] == "error":
-                    raise RuntimeError(f"user {user_id}: {loss[1]}")
-                results[user_id]["a_logloss" if worker_index == 0 else "b_logloss"] = loss
-            print(f"paired user {user_id}/{len(users)}", flush=True)
-        for connection in connections:
-            connection.send(None)
-        for worker in workers:
-            worker.join()
-    rows = list(results.values())
-    ratios = [row["a_ms"] / row["b_ms"] for row in rows]
-    mean_a = statistics.mean(row["a_logloss"] for row in rows)
-    mean_b = statistics.mean(row["b_logloss"] for row in rows)
-    summary = {
-        "users": len(rows),
-        "median_speedup": statistics.median(ratios),
-        "mean_speedup": statistics.mean(ratios),
-        "median_ms_baseline": statistics.median(row["a_ms"] for row in rows),
-        "median_ms_candidate": statistics.median(row["b_ms"] for row in rows),
-        "mean_logloss_baseline": mean_a,
-        "mean_logloss_candidate": mean_b,
-        "candidate_logloss_in_band": (0.3078 <= mean_b <= 0.3113) if len(rows) == 50 else None,
-        "parameter_hash_diffs": sum(
-            hashlib.sha256(repr(row["a_parameters"]).encode()).digest()
-            != hashlib.sha256(repr(row["b_parameters"]).encode()).digest()
-            for row in rows
-        ),
-    }
-    Path("result").mkdir(exist_ok=True)
-    result_file = Path(f"result/{OUTPUT_NAME}.json")
-    result_file.write_text(json.dumps({"summary": summary, "per_user": results}, indent=2))
-    print(json.dumps(summary, indent=2))
-    if summary["candidate_logloss_in_band"] is False:
-        raise AssertionError(
-            f"candidate mean LogLoss {mean_b:.6f} outside [0.3078, 0.3113]"
-        )
+        try:
+            for path in paths:
+                parent, child = Pipe()
+                worker = Process(target=_paired_worker, args=(str(path), child))
+                worker.start()
+                workers.append(worker)
+                connections.append(parent)
+            for conn in connections:
+                if conn.recv() != "ready":
+                    raise RuntimeError("paired worker failed to initialize")
+            cpu_blocks = [
+                available_cpus[:2],
+                available_cpus[2:4],
+                available_cpus[-4:-2],
+                available_cpus[-2:],
+            ]
+            for user_index, user_id in enumerate(remaining_users):
+                for connection in connections:
+                    connection.send(("prepare", user_id, None))
+                item_counts = []
+                for connection in connections:
+                    reply = connection.recv()
+                    if not isinstance(reply, tuple) or reply[0] != "prepared" or reply[1] != user_id:
+                        if isinstance(reply, tuple) and reply and reply[0] == "error":
+                            raise RuntimeError(f"user {user_id}: {reply[1]}")
+                        raise RuntimeError(f"user {user_id}: paired worker preparation failed")
+                    item_counts.append(reply[2])
+                if item_counts[0] != item_counts[1]:
+                    raise ValueError(
+                        f"user {user_id}: baseline and candidate received different item counts"
+                    )
+                timings = [[], []]
+                params = [None, None]
+                for repeat in range(TIMING_REPEATS):
+                    block_set_offset = 2 if (repeat + user_index) % 2 else 0
+                    blocks = cpu_blocks[block_set_offset : block_set_offset + 2]
+                    worker_to_block = [0, 1] if (repeat + user_index) % 2 == 0 else [1, 0]
+                    worker_order = [0, 1] if repeat % 2 == 0 else [1, 0]
+                    for worker_index in worker_order:
+                        block_index = worker_to_block[worker_index]
+                        connections[worker_index].send(
+                            ("timed", user_id, blocks[block_index])
+                        )
+                    for worker_index in range(2):
+                        if not connections[worker_index].poll(1800):
+                            raise RuntimeError(
+                                f"user {user_id}: paired worker timed out after 30 minutes"
+                            )
+                        reply = connections[worker_index].recv()
+                        if isinstance(reply, tuple) and reply and reply[0] == "error":
+                            raise RuntimeError(f"user {user_id}: {reply[1]}")
+                        milliseconds, params[worker_index] = reply
+                        timings[worker_index].append(milliseconds)
+                if min(timings[0]) <= 0 or min(timings[1]) <= 0:
+                    raise RuntimeError(f"user {user_id}: optimizer returned a non-positive timing")
+                results[user_id] = {
+                    "size": item_counts[0],
+                    "a_runs_ms": timings[0], "b_runs_ms": timings[1],
+                    "a_ms": min(timings[0]), "b_ms": min(timings[1]),
+                    "a_parameters": params[0], "b_parameters": params[1],
+                }
+                results[user_id]["a_logloss"] = None
+                results[user_id]["b_logloss"] = None
+                _write_paired_checkpoint(checkpoint_file, checkpoint_metadata, results)
+                for worker_index, connection in enumerate(connections):
+                    connection.send(("score", user_id, None, params[worker_index]))
+                for worker_index, connection in enumerate(connections):
+                    loss = connection.recv()
+                    if isinstance(loss, tuple) and loss and loss[0] == "error":
+                        raise RuntimeError(f"user {user_id}: {loss[1]}")
+                    results[user_id]["a_logloss" if worker_index == 0 else "b_logloss"] = loss
+                _write_paired_checkpoint(checkpoint_file, checkpoint_metadata, results)
+                print(f"paired user {user_id}/{len(users)}", flush=True)
+        finally:
+            for connection in connections:
+                try:
+                    connection.send(None)
+                except (BrokenPipeError, OSError):
+                    pass
+            for worker in workers:
+                worker.join(timeout=30)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join()
+    _write_paired_result(results, checkpoint_metadata)
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     if args.paired:
