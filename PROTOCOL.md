@@ -28,8 +28,22 @@ On supported Windows x86-64 machines, the paired harness runs both builds simult
 Sequential fallback measurements may be used when simultaneous processes are unavailable; alternate build order, retain the same repeats, and label them unpaired. Do not treat runs from different machines or substantially different load conditions as paired.
 ### Setup (Windows)
 Do not change power plans, process priority, affinity, or processor frequency settings from their normal configuration. Record CPU model, OS, Python/Rust versions, date, process count, and whether timing was paired.
-## Leaderboard fields
-For every model/experiment (at most 20), preserve the source revision and record: experiment number, model (filled in by human), median paired speedup, per-user timing summary, mean LogLoss, baseline LogLoss, and machine/software environment. A change outside the accuracy band is **not a valid speedup**. Report API cost separately from optimizer speed.
+## Leaderboards and agent iteration logs
+The model leaderboard in `README.md` is maintained by the human project owner. Agents must not edit or reorder it.
+
+Each agent must maintain an experiment `.md` file in its isolated worktree, with one row for every completed run and these columns:
+
+| iter | median time_before (ms) | median time_after (ms) | speed_ratio | log loss before | log loss after | accepted/rejected | summary of the change |
+|---|---:|---:|---:|---:|---:|---|---|
+
+- `iter` is the experiment number (1–20). An error or failed/incomplete run does not consume an iteration; fix it and retry using the same number. It is not marked accepted or rejected.
+- `median time_before` and `median time_after` are medians of per-user times in milliseconds, using each user's minimum of three Rust-call timings.
+- `speed_ratio` is the **median of per-user ratios** `baseline_ms / candidate_ms`, not the ratio of median times. It must be at least `1.015` to pass.
+- `log loss before` and `log loss after` are the baseline and candidate means across the fixed 50 users. The candidate must be in the accuracy band.
+- Mark a completed run accepted only when both the speed threshold and accuracy band pass; otherwise mark it rejected.
+- `summary of the change` is written by the agent and describes the single conceptual change.
+
+Record model/provider and slug, prompt/version, API cost and available token counts, source revision, and machine/software environment as metadata in the same file. The human updates the README model leaderboard; the agent-authored file is the detailed run log.
 ## Fairness and implementation constraints
 - **CPU only:** GPU execution, GPU-specific libraries, and accelerator offloading are prohibited.
 - **Single-user optimization only:** `compute_parameters()` must optimize exactly one user's training set per call. Joint optimization, cross-user batching, and vectorizing work across users (including multi-user SIMD) are prohibited; benchmark throughput improvements must come from a faster per-user optimizer call.
