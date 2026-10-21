@@ -36,7 +36,7 @@ powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 99
 powercfg /setactive SCHEME_CURRENT
 ```
 Tell your human about it and make sure you have the human's permission to run these (or similar, depends on OS) commands. Don't forget to unlock the CPU after the 20 experiments are done.
-Record CPU model, OS, Python/Rust versions, date, process count, and whether timing was paired.
+Record CPU model, OS, Python/Rust versions, date, per-user thread count (must be 1), process count across users, and whether timing was paired.
 
 ## Leaderboards and agent iteration logs
 The model leaderboard in `README.md` is maintained by the human project owner. Agents must not edit or reorder it.
@@ -60,7 +60,7 @@ The README's **total cumulative speedup** is the overall accumulated improvement
 
 ## Fairness and implementation constraints
 - **CPU only:** GPU execution, GPU-specific libraries, and accelerator offloading are prohibited.
-- **Single-user optimization only:** `compute_parameters()` must optimize exactly one user's training set per call. Joint optimization, cross-user batching, and vectorizing work across users (including multi-user SIMD) are prohibited; benchmark throughput improvements must come from a faster per-user optimizer call.
+- **Single-user, single-thread optimization:** `compute_parameters()` must optimize exactly one user's training set per call and use only one thread for that user's optimization. Per-user multithreading is prohibited. Separate users may still be processed concurrently in separate processes, as in the benchmark harness. Joint optimization, cross-user batching, and vectorizing work across users (including multi-user SIMD) are prohibited; benchmark throughput improvements must come from a faster single-threaded per-user optimizer call.
 - **Timed work:** all work needed to optimize a user's parameters must remain inside the timed Rust `compute_parameters()` call. Do not precompute, cache, asynchronously perform, or move optimizer work into Python preprocessing, initialization, evaluation, background threads, or any other untimed region. Only deterministic input preparation and post-training evaluation are outside the timed interval.
 - **Portable implementation:** CPU only; GPU execution, GPU-specific libraries, accelerator offloading, runtime CPU-specific dispatch, and machine-specific build flags are prohibited. SIMD is permitted only with baseline SSE2 instructions, which are part of the x86-64 baseline; do not require newer instruction sets. Compile for the generic x86-64 baseline, not the build host's native CPU.
 - **Reproducibility:** preserve the same fixed input and model semantics, and report any nondeterminism. Do not suppress failed users or change the scoring population.
