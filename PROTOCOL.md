@@ -1,14 +1,14 @@
-# FSRS Optimizer Bench protocol
+﻿# FSRS Optimizer Bench protocol
 
 This is the measurement contract for FSRS Optimizer Bench. A faster optimizer only counts when it remains inside the accuracy band on the fixed user set.
 
 ## Frozen benchmark
-- **Dataset:** bundled at [`data/revlogs`](https://github.com/Expertium/fsrs-optimizer-bench/tree/main/data/revlogs), with one partition for each user 1–50. It is derived from the public [`open-spaced-repetition/anki-revlogs-10k`](https://huggingface.co/datasets/open-spaced-repetition/anki-revlogs-10k) dataset and processes 1,897,936 optimizer items.
+- **Dataset:** bundled at [`data/revlogs`](https://github.com/Expertium/fsrs-optimizer-bench/tree/main/data/revlogs), with one partition for each user 1ΓÇô50. It is derived from the public [`open-spaced-repetition/anki-revlogs-10k`](https://huggingface.co/datasets/open-spaced-repetition/anki-revlogs-10k) dataset and processes 1,897,936 optimizer items.
 - **Input mode:** include short-term reviews, use elapsed seconds converted to days, and apply the existing recency weighting (`--short --secs --recency`). Preserve item order, filtering, seed, and batch construction.
 - **Model:** finished 34-parameter FSRS-7. Reference equations are in [`models/fsrs_v7.py`](https://github.com/open-spaced-repetition/srs-benchmark/blob/main/models/fsrs_v7.py); the Rust recurrence is in `fsrs-rs/src/model.rs`.
 - **Optimizer baseline:** unoptimized Burn/autodiff implementation, 9 epochs, batch size 256, seed 2023, learning rate 0.0282, Adam beta values 0.55 and 0.9942, and per-epoch validation/best-epoch selection. Preserve the exact baseline implementation when evaluating candidates. Do NOT modify hyperparameters (n epochs, learning rate, betas for Adam, etc.) throughout your 20 experiments.
 - **Timed region:** only the Rust `compute_parameters()` call, timed with a monotonic clock inside the Python binding. Python input conversion and evaluation are excluded.
-- **Accuracy:** after timing, evaluate the trained parameters on the user's same items with the frozen Rust evaluator. The arithmetic mean of the 50 per-user LogLoss values must be **[0.3066, 0.3096] inclusive** (0.3081 ± 0.0015).
+- **Accuracy:** after timing, evaluate the trained parameters on the user's same items with the frozen Rust evaluator. The arithmetic mean of the 50 per-user LogLoss values must be **[0.3066, 0.3096] inclusive** (0.3081 ┬▒ 0.0015).
 Keep the model and inputs fixed; otherwise the results are not comparable.
 ## Experiment scope
 Each experiment must change one conceptual thing; do not bundle unrelated changes into one run. A major refactor is acceptable when it is a cohesive change to one concept. Record the exact source revision and candidate build used for every result.
