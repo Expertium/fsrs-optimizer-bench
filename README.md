@@ -4,8 +4,6 @@ FSRS (Free Spaced Repetition Scheduler) schedules flashcard reviews by predictin
 
 This benchmark compares AI-generated optimizer changes using a fixed, reproducible review-log dataset and accuracy requirements. See also https://github.com/Expertium/fsrs-rs-speed-autoresearch.
 
-If you would like to contribute to this benchmark, give your agent the link to this repository and ask it to read [PROTOCOL.md](PROTOCOL.md).
-
 ## Model leaderboard
 
 | Model name | Reasoning effort | Harness | Total cumulative speedup | Acceptance rate | API costs |
