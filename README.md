@@ -15,6 +15,6 @@ powercfg /setactive SCHEME_CURRENT
 ## Model leaderboard
 
 | Model name | Reasoning effort | Harness | Cumulative speedup | Acceptance rate | API costs |
-| Haiku 5.5 | High | OpenHands |---|---|---|
+| Claude Haiku 5.5 | High | OpenHands |---|---|---|
 
 Cumulative speedup is based on before/after optimization time on review histories of 50 Anki users. Each accepted result must meet certain criteria; see [PROTOCOL.md](PROTOCOL.md) for setup, commands, and rules. Acceptance rate shows how many experiments successfully made the optimizer faster.
