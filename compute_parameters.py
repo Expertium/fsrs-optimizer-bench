@@ -204,7 +204,8 @@ def _paired_summary(results: dict) -> dict:
     candidate_loss = statistics.mean(row["candidate_logloss"] for row in rows)
     return {
         "users": len(rows),
-        "total_items": sum(row["size"] for row in rows),
+        "total_items": sum(row["baseline_size"] for row in rows),
+        "candidate_total_items": sum(row["candidate_size"] for row in rows),
         "median_speedup": statistics.median(row["baseline_ms"] / row["candidate_ms"] for row in rows),
         "mean_speedup": statistics.mean(row["baseline_ms"] / row["candidate_ms"] for row in rows),
         "median_ms_baseline": statistics.median(row["baseline_ms"] for row in rows),
@@ -213,6 +214,12 @@ def _paired_summary(results: dict) -> dict:
         "mean_logloss_candidate": candidate_loss,
         "baseline_logloss_in_band": 0.3066 <= baseline_loss <= 0.3096 if len(rows) == 50 else None,
         "candidate_logloss_in_band": 0.3066 <= candidate_loss <= 0.3096 if len(rows) == 50 else None,
+        "review_counts_match": all(row["baseline_size"] == row["candidate_size"] for row in rows),
+        "review_count_mismatches": [
+            user_id
+            for user_id, row in results.items()
+            if row["baseline_size"] != row["candidate_size"]
+        ],
         "full_run": len(rows) == 50,
     }
 def _write_paired_result(results: dict, metadata: dict) -> dict:
@@ -223,6 +230,8 @@ def _write_paired_result(results: dict, metadata: dict) -> dict:
         raise AssertionError(f"expected 1,897,936 paired items, got {summary['total_items']:,}")
     reasons = []
     if summary["full_run"]:
+        if not summary["review_counts_match"]:
+            reasons.append("per-user processed review counts differ from baseline")
         if not summary["baseline_logloss_in_band"]:
             raise RuntimeError("pinned baseline failed the accuracy band; this run is invalid, not rejected")
         if not summary["candidate_logloss_in_band"]:
@@ -285,6 +294,8 @@ def _run_paired_benchmark(baseline_path: str, candidate_path: str) -> None:
                     and len(row.get("candidate_runs_ms", [])) == TIMING_REPEATS
                     and isinstance(row.get("baseline_logloss"), (int, float))
                     and isinstance(row.get("candidate_logloss"), (int, float))
+                    and isinstance(row.get("baseline_size"), int)
+                    and isinstance(row.get("candidate_size"), int)
                 }
         except (OSError, ValueError, TypeError):
             results = {}
@@ -324,8 +335,6 @@ def _run_paired_benchmark(baseline_path: str, candidate_path: str) -> None:
                     if not isinstance(reply, tuple) or reply[0] != "prepared" or reply[1] != user_id:
                         detail = reply[1] if isinstance(reply, tuple) and len(reply) > 1 else reply
                         raise RuntimeError(f"input preparation failed for user {user_id}: {detail}")
-                if prepared[0][2] != prepared[1][2]:
-                    raise RuntimeError(f"baseline/candidate item count mismatch for user {user_id}")
                 timings = [[], []]
                 parameters = [None, None]
                 for repeat in range(TIMING_REPEATS):
@@ -355,6 +364,8 @@ def _run_paired_benchmark(baseline_path: str, candidate_path: str) -> None:
                         raise RuntimeError(f"evaluation failed for user {user_id}: {reply[1]}")
                 results[user_id] = {
                     "size": prepared[0][2],
+                    "baseline_size": prepared[0][2],
+                    "candidate_size": prepared[1][2],
                     "baseline_runs_ms": timings[0],
                     "candidate_runs_ms": timings[1],
                     "baseline_ms": min(timings[0]),
