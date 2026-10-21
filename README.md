@@ -10,4 +10,4 @@ If you would like to contribute to this benchmark, give your agent the link to t
 
 | Model name | Reasoning effort | Harness | Total cumulative speedup | Acceptance rate | API costs |
 |---|---|---|---:|---:|---:|
-| Claude Haiku 5.5 | High | OpenHands | TBD | TBD | TBD |
+| --- | --- | --- | --- | --- | --- |
