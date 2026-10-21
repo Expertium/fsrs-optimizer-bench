@@ -26,8 +26,17 @@ On supported Windows x86-64 machines, the paired harness runs both builds simult
 4. Use each build's minimum of three timings; calculate per-user `baseline / candidate` ratios and their median.
 5. Evaluate both builds after timing; confirm the candidate remains in-band and record the baseline/candidate accuracy difference.
 Sequential fallback measurements may be used when simultaneous processes are unavailable; alternate build order, retain the same repeats, and label them unpaired. Do not treat runs from different machines or substantially different load conditions as paired.
+
 ### Setup (Windows)
-Do not change power plans, process priority, affinity, or processor frequency settings from their current configuration. Record CPU model, OS, Python/Rust versions, date, process count, and whether timing was paired.
+Lock the CPU frequency. On Windows 10, you can run the following commands:
+```bat
+powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 99
+powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 99
+powercfg /setactive SCHEME_CURRENT
+```
+Tell your human about it and make sure you have the human's permission to run these (or similar, depends on OS) commands. Don't forget to unlock the CPU after the 20 experiments are done.
+Record CPU model, OS, Python/Rust versions, date, process count, and whether timing was paired.
+
 ## Leaderboards and agent iteration logs
 The model leaderboard in `README.md` is maintained by the human project owner. Agents must not edit or reorder it.
 
@@ -46,6 +55,7 @@ Each agent must maintain an experiment `.md` file in its isolated worktree, with
 Record model/provider and slug, prompt/version, API cost and available token counts, source revision, and machine/software environment as metadata in the same file. The human updates the README model leaderboard; the agent-authored file is the detailed run log.
 
 The README's **total cumulative speedup** is the overall accumulated improvement for a model across its accepted optimizer changes. **Acceptance rate** is `accepted / (accepted + rejected)`; error/incomplete attempts are excluded from both counts. **API costs** are the model's total API spend for its reported experiments, kept separate from measured optimizer speed.
+
 ## Fairness and implementation constraints
 - **CPU only:** GPU execution, GPU-specific libraries, and accelerator offloading are prohibited.
 - **Single-user optimization only:** `compute_parameters()` must optimize exactly one user's training set per call. Joint optimization, cross-user batching, and vectorizing work across users (including multi-user SIMD) are prohibited; benchmark throughput improvements must come from a faster per-user optimizer call.
