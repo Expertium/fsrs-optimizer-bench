@@ -8,7 +8,7 @@ This is the measurement contract for FSRS Optimizer Bench. A faster optimizer on
 - **Model:** finished 34-parameter FSRS-7. Reference equations are in [`models/fsrs_v7.py`](https://github.com/open-spaced-repetition/srs-benchmark/blob/main/models/fsrs_v7.py); the Rust recurrence is in `fsrs-rs/src/model.rs`.
 - **Optimizer baseline:** unoptimized Burn/autodiff implementation, 9 epochs, batch size 256, seed 2023, learning rate 0.0282, Adam beta values 0.55 and 0.9942, and per-epoch validation/best-epoch selection. Preserve the exact baseline implementation when evaluating candidates. Do NOT modify hyperparameters (n epochs, learning rate, betas for Adam, etc.) throughout your 20 experiments.
 - **Timed region:** only the Rust `compute_parameters()` call, timed with a monotonic clock inside the Python binding. Python input conversion and evaluation are excluded.
-- **Accuracy:** after timing, evaluate the trained parameters on the user's same items with the frozen Rust evaluator. The arithmetic mean of the 50 per-user LogLoss values must be **[0.3066, 0.3096] inclusive** (0.3081 ┬▒ 0.0015).
+- **Accuracy:** after timing, evaluate the trained parameters on the user's same items with the frozen Rust evaluator. The arithmetic mean of the 50 per-user LogLoss values must be **[0.3066, 0.3096] inclusive** (0.3081±0.0015).
 Keep the model and inputs fixed; otherwise the results are not comparable.
 ## Experiment scope
 Each experiment must change one conceptual thing; do not bundle unrelated changes into one run. A major refactor is acceptable when it is a cohesive change to one concept. Record the exact source revision and candidate build used for every result.
@@ -27,7 +27,7 @@ On supported Windows x86-64 machines, the paired harness runs both builds simult
 5. Evaluate both builds after timing; confirm the candidate remains in-band and record the baseline/candidate accuracy difference.
 Sequential fallback measurements may be used when simultaneous processes are unavailable; alternate build order, retain the same repeats, and label them unpaired. Do not treat runs from different machines or substantially different load conditions as paired.
 ### Setup (Windows)
-Do not change power plans, process priority, affinity, or processor frequency settings from their normal configuration. Record CPU model, OS, Python/Rust versions, date, process count, and whether timing was paired.
+Do not change power plans, process priority, affinity, or processor frequency settings from their current configuration. Record CPU model, OS, Python/Rust versions, date, process count, and whether timing was paired.
 ## Leaderboards and agent iteration logs
 The model leaderboard in `README.md` is maintained by the human project owner. Agents must not edit or reorder it.
 
