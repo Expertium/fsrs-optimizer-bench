@@ -44,6 +44,8 @@ Each agent must maintain an experiment `.md` file in its isolated worktree, with
 - `summary of the change` is written by the agent and describes the single conceptual change.
 
 Record model/provider and slug, prompt/version, API cost and available token counts, source revision, and machine/software environment as metadata in the same file. The human updates the README model leaderboard; the agent-authored file is the detailed run log.
+
+The README's **total cumulative speedup** is the overall accumulated improvement for a model across its accepted optimizer changes. **Acceptance rate** is `accepted / (accepted + rejected)`; error/incomplete attempts are excluded from both counts. **API costs** are the model's total API spend for its reported experiments, kept separate from measured optimizer speed.
 ## Fairness and implementation constraints
 - **CPU only:** GPU execution, GPU-specific libraries, and accelerator offloading are prohibited.
 - **Single-user optimization only:** `compute_parameters()` must optimize exactly one user's training set per call. Joint optimization, cross-user batching, and vectorizing work across users (including multi-user SIMD) are prohibited; benchmark throughput improvements must come from a faster per-user optimizer call.
@@ -51,3 +53,52 @@ Record model/provider and slug, prompt/version, API cost and available token cou
 - **Portable implementation:** CPU only; GPU execution, GPU-specific libraries, accelerator offloading, runtime CPU-specific dispatch, and machine-specific build flags are prohibited. SIMD is permitted only with baseline SSE2 instructions, which are part of the x86-64 baseline; do not require newer instruction sets. Compile for the generic x86-64 baseline, not the build host's native CPU.
 - **Reproducibility:** preserve the same fixed input and model semantics, and report any nondeterminism. Do not suppress failed users or change the scoring population.
 - **Scope:** keep candidate changes focused on one conceptual change. Do not bundle multiple unrelated changes into a single experiment.
+
+## Setup and benchmark commands
+
+### Requirements and data
+
+Use Windows 10/11 x64, Python 3.12+, `uv`, and Rust 1.85 (pinned in `fsrs-rs/rust-toolchain.toml`). The repository includes the revlog partitions for users 1–50 under [`data/revlogs`](https://github.com/Expertium/fsrs-optimizer-bench/tree/main/data/revlogs), so a full Hugging Face download is unnecessary. This is a subset of the public [`open-spaced-repetition/anki-revlogs-10k`](https://huggingface.co/datasets/open-spaced-repetition/anki-revlogs-10k) dataset; only numeric review-log fields are included. To use another copy, pass its dataset root using `--data`.
+
+From the repository directory:
+
+```powershell
+uv sync
+uv run python -m pytest -q
+cargo +1.85 fmt --manifest-path fsrs-rs/Cargo.toml --all -- --check
+```
+
+`uv sync` installs the locked Python dependencies. The Rust extension builds automatically on first import using the pinned toolchain and CPython stable ABI (Python 3.12+).
+
+### Canonical benchmark
+
+```powershell
+uv run python compute_parameters.py --algo FSRS-rs --short --secs --recency --processes 10 --max-user-id 50 --run-name baseline
+```
+
+The canonical run uses 50 users and 1,897,936 optimizer items. Each user is optimized three times; the minimum Rust-call time is retained, then LogLoss is evaluated. Results are saved to `result/compute_parameters-FSRS-rs-short-secs-recency-baseline.jsonl`. A unique `--run-name` separates each run. If interrupted, rerun the same command to resume missing users; remove that run's result file first for an intentional clean repeat. The default dataset root is the repository's `data/` directory; `--data` overrides it.
+
+### Prepare an isolated experiment
+
+Create the protected baseline once, then create a clean detached worktree for each experiment number (1–20):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/experiment.ps1 -Action prepare-baseline
+powershell -ExecutionPolicy Bypass -File scripts/experiment.ps1 -Action new -Experiment 1
+```
+
+The helper builds the baseline from commit `0485116` in a disposable detached worktree, stores the extension and SHA-256 manifest in the ignored top-level `baseline/` folder, and refuses to overwrite an existing artifact. Each numbered experiment is a separate worktree outside the repository at `../fsrs-optimizer-bench-experiments/run-NN`, with its own source tree, Cargo target directory, and local baseline copy at `baseline/fsrs_rs_python.abi3.pyd`. Work only in that experiment worktree. Never edit, rebuild over, or replace the protected top-level baseline with a candidate. Do not combine setup changes with an optimizer experiment.
+
+For experiment 1, from `../fsrs-optimizer-bench-experiments/run-01`, build the candidate and run its paired comparison:
+
+```powershell
+$env:CARGO_TARGET_DIR = "fsrs_rs_python/target/experiment-1"
+cargo +1.85 build --manifest-path fsrs_rs_python/Cargo.toml --release --features pyo3/extension-module,pyo3/abi3-py312
+New-Item -ItemType Directory -Force profiling/measure | Out-Null
+Copy-Item fsrs_rs_python/target/experiment-1/release/fsrs_rs_python.dll profiling/measure/candidate.abi3.pyd
+uv run python compute_parameters.py --algo FSRS-rs --short --secs --recency --max-user-id 50 --run-name experiment-1 --paired baseline/fsrs_rs_python.abi3.pyd profiling/measure/candidate.abi3.pyd
+```
+
+The paired harness compares the baseline and candidate on the same user's inputs in separate processes, alternating launch order for the three repeats without changing CPU affinity or priority. It reports the median per-user `baseline_ms / candidate_ms` ratio and both mean LogLoss values. Per-user timings and summary are saved under `result/`.
+
+A completed accepted or rejected run consumes one experiment number. Errors or incomplete runs may be fixed and retried under the same number; they are not rejected and do not count against the 20-run budget. See the sections above for exact acceptance criteria and required agent log.
