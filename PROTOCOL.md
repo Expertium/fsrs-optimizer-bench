@@ -65,6 +65,7 @@ The README's **total cumulative speedup** is the overall accumulated improvement
 - **Portable implementation:** CPU only; GPU execution, GPU-specific libraries, accelerator offloading, runtime CPU-specific dispatch, and machine-specific build flags are prohibited. SIMD is permitted only with baseline SSE2 instructions, which are part of the x86-64 baseline; do not require newer instruction sets. Compile for the generic x86-64 baseline, not the build host's native CPU.
 - **Reproducibility:** preserve the same fixed input and model semantics, and report any nondeterminism. Do not suppress failed users or change the scoring population.
 - **Scope:** keep candidate changes focused on one conceptual change. Do not bundle multiple unrelated changes into a single experiment. Removing Burn entirely and replacing it with hand-written code is allowed. You (the AI agent) can perform any experiments, including substantial rewrites and careful error-prone changes, as long as the baseline code stays untouched. Making FSRS-7-specific changes that are not applicable to other versions of FSRS (for example, hard-coding the recency weight formula) is allowed.
+- **Internet search**. You are allowed to do Internet search, but you must **NOT** read FSRS-related Github repositories. This is a benchmark of your own ability to speed up the optimizer.
 
 ## Setup and benchmark commands
 
