@@ -54,9 +54,9 @@ Each agent must maintain an experiment `.md` file in its isolated worktree, with
 - Mark a completed run accepted only when all three criteria pass: speed threshold, accuracy band, and exact per-user processed-review counts; otherwise mark it rejected.
 - `summary of the change` is written by the agent and describes the single conceptual change.
 
-Record model, API cost and available token counts (if available), and machine/software environment as metadata in the same file. The human updates the README model leaderboard; the agent-authored file is the detailed run log.
+Record machine/software environment as metadata in the same file. The human updates the README model leaderboard; the agent-authored file is the detailed run log.
 
-The README's **total cumulative speedup** is the overall accumulated improvement for a model across its accepted optimizer changes. **Acceptance rate** is `accepted / (accepted + rejected)`; error/incomplete attempts are excluded from both counts. **API costs** are the model's total API spend for its reported experiments, kept separate from measured optimizer speed.
+The README's **total cumulative speedup** is the overall accumulated improvement for a model across its accepted optimizer changes. **Acceptance rate** is `accepted / (accepted + rejected)`; error/incomplete attempts are excluded from both counts. **API costs** are the model's total API spend for its reported experiments.
 
 ## Fairness and implementation constraints
 - **CPU only:** GPU execution, GPU-specific libraries, and accelerator offloading are prohibited.
